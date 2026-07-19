@@ -14,13 +14,21 @@ import "@openzeppelin/contracts@5.6.1/utils/cryptography/MessageHashUtils.sol";
 // bit-shifting fixed-point math is exactly where hand-rolled code tends to
 // introduce subtle, expensive bugs). Uniswap's original v3-core libraries
 // are pinned to pragma <0.8.0 and won't compile here, so this uses the
-// same math ported natively to 0.8.x as part of v4-core/v4-periphery —
-// same formulas, just a modern Solidity target. Confirmed via the official
-// Uniswap GitHub before using: TickMath.sol here declares `pragma solidity
-// ^0.8.0`, same for the FullMath.sol it depends on.
+// same math ported natively to 0.8.x as part of v4-core — same formulas,
+// just a modern Solidity target. Confirmed via the official Uniswap GitHub
+// before using: TickMath.sol here declares `pragma solidity ^0.8.0`, same
+// for FullMath.sol and FixedPoint96.sol.
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
-import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
+// NOTE: v4-periphery's LiquidityAmounts.sol does NOT include
+// getAmountsForLiquidity() (only the reverse direction — v4's architecture
+// doesn't need it the way a v3-style NFT position does). That specific
+// function is ported below in _getAmountsForLiquidity(), copied verbatim
+// from Uniswap's audited v3-periphery LiquidityAmounts.sol (only the
+// FullMath/FixedPoint96 source swapped for the 0.8.x-compatible ones above
+// — the math itself is untouched):
+// https://github.com/Uniswap/v3-periphery/blob/main/contracts/libraries/LiquidityAmounts.sol
 
 /// @dev Minimal interface — only the functions this contract actually calls.
 ///      Deliberately not importing Uniswap's own v3-periphery package for
@@ -436,7 +444,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
             if (liquidity > 0) {
                 (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
 
-                (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
+                (uint256 amount0, uint256 amount1) = _getAmountsForLiquidity(
                     sqrtPriceX96,
                     TickMath.getSqrtPriceAtTick(tickLower),
                     TickMath.getSqrtPriceAtTick(tickUpper),
@@ -490,6 +498,52 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         } else {
             // WETH is token0, USDC is token1 -> priceX96 = token1(USDC)/token0(WETH) directly
             return FullMath.mulDiv(wethAmount, priceX96, Q96);
+        }
+    }
+
+    // ---- Ported from Uniswap v3-periphery's LiquidityAmounts.sol ----
+    // (audited, unchanged math; only FullMath/FixedPoint96 source swapped
+    // for the 0.8.x-native versions from v4-core — see import comment above)
+
+    function _getAmount0ForLiquidity(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint128 liquidity)
+        private
+        pure
+        returns (uint256 amount0)
+    {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        return FullMath.mulDiv(
+            uint256(liquidity) << FixedPoint96.RESOLUTION,
+            sqrtRatioBX96 - sqrtRatioAX96,
+            sqrtRatioBX96
+        ) / sqrtRatioAX96;
+    }
+
+    function _getAmount1ForLiquidity(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint128 liquidity)
+        private
+        pure
+        returns (uint256 amount1)
+    {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        return FullMath.mulDiv(liquidity, sqrtRatioBX96 - sqrtRatioAX96, FixedPoint96.Q96);
+    }
+
+    /// @dev Computes token0/token1 value for a given amount of liquidity at
+    ///      the current pool price and a position's tick boundaries.
+    function _getAmountsForLiquidity(
+        uint160 sqrtRatioX96,
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint128 liquidity
+    ) private pure returns (uint256 amount0, uint256 amount1) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+
+        if (sqrtRatioX96 <= sqrtRatioAX96) {
+            amount0 = _getAmount0ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity);
+        } else if (sqrtRatioX96 < sqrtRatioBX96) {
+            amount0 = _getAmount0ForLiquidity(sqrtRatioX96, sqrtRatioBX96, liquidity);
+            amount1 = _getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioX96, liquidity);
+        } else {
+            amount1 = _getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity);
         }
     }
 }
