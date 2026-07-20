@@ -361,30 +361,51 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         uint256 oldTokenId = currentPositionTokenId;
 
         if (oldTokenId != 0) {
-            (, , , , , , , uint128 liquidity, , , ,) = positionManager.positions(oldTokenId);
+            _closeOldPosition(oldTokenId);
+        }
 
-            if (liquidity > 0) {
-                positionManager.decreaseLiquidity(
-                    INonfungiblePositionManager.DecreaseLiquidityParams({
-                        tokenId: oldTokenId,
-                        liquidity: liquidity,
-                        amount0Min: 0,
-                        amount1Min: 0,
-                        deadline: block.timestamp
-                    })
-                );
-            }
+        (uint256 newTokenId, uint256 amount0, uint256 amount1) = _openNewPosition(tickLower, tickUpper);
 
-            positionManager.collect(
-                INonfungiblePositionManager.CollectParams({
+        currentPositionTokenId = newTokenId;
+
+        emit Rebalanced(oldTokenId, newTokenId, tickLower, tickUpper, amount0, amount1);
+    }
+
+    /// @dev Split out of rebalance() to keep local-variable counts down in
+    ///      each function ("stack too deep" otherwise) — no logic changed,
+    ///      just isolated. Pulls all liquidity out of the old position and
+    ///      collects it (+ any accrued fees) back onto this contract.
+    function _closeOldPosition(uint256 oldTokenId) private {
+        (, , , , , , , uint128 liquidity, , , ,) = positionManager.positions(oldTokenId);
+
+        if (liquidity > 0) {
+            positionManager.decreaseLiquidity(
+                INonfungiblePositionManager.DecreaseLiquidityParams({
                     tokenId: oldTokenId,
-                    recipient: address(this),
-                    amount0Max: type(uint128).max,
-                    amount1Max: type(uint128).max
+                    liquidity: liquidity,
+                    amount0Min: 0,
+                    amount1Min: 0,
+                    deadline: block.timestamp
                 })
             );
         }
 
+        positionManager.collect(
+            INonfungiblePositionManager.CollectParams({
+                tokenId: oldTokenId,
+                recipient: address(this),
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            })
+        );
+    }
+
+    /// @dev Also split out for the same stack-depth reason — mints a fresh
+    ///      position from whatever the vault currently holds.
+    function _openNewPosition(int24 tickLower, int24 tickUpper)
+        private
+        returns (uint256 newTokenId, uint256 amount0, uint256 amount1)
+    {
         (address token0, address token1) = _sortedTokens();
 
         uint256 balance0 = IERC20(token0).balanceOf(address(this));
@@ -393,7 +414,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         IERC20(token0).forceApprove(address(positionManager), balance0);
         IERC20(token1).forceApprove(address(positionManager), balance1);
 
-        (uint256 newTokenId, , uint256 amount0, uint256 amount1) = positionManager.mint(
+        (newTokenId, , amount0, amount1) = positionManager.mint(
             INonfungiblePositionManager.MintParams({
                 token0: token0,
                 token1: token1,
@@ -412,10 +433,6 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         // Revoke any leftover approval rather than leaving it standing.
         IERC20(token0).forceApprove(address(positionManager), 0);
         IERC20(token1).forceApprove(address(positionManager), 0);
-
-        currentPositionTokenId = newTokenId;
-
-        emit Rebalanced(oldTokenId, newTokenId, tickLower, tickUpper, amount0, amount1);
     }
 
     /// @notice Total vault value, expressed in `asset()` (USDC) — the number
@@ -433,46 +450,63 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         uint256 idleUsdc = IERC20(asset()).balanceOf(address(this));
         uint256 idleWeth = pairToken.balanceOf(address(this));
 
-        uint256 positionUsdc;
-        uint256 positionWeth;
-
-        uint256 tokenId = currentPositionTokenId;
-        if (tokenId != 0) {
-            (, , , , , int24 tickLower, int24 tickUpper, uint128 liquidity, , , uint128 tokensOwed0, uint128 tokensOwed1) =
-                positionManager.positions(tokenId);
-
-            if (liquidity > 0) {
-                (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
-
-                (uint256 amount0, uint256 amount1) = _getAmountsForLiquidity(
-                    sqrtPriceX96,
-                    TickMath.getSqrtPriceAtTick(tickLower),
-                    TickMath.getSqrtPriceAtTick(tickUpper),
-                    liquidity
-                );
-
-                if (assetIsToken0) {
-                    positionUsdc = amount0;
-                    positionWeth = amount1;
-                } else {
-                    positionWeth = amount0;
-                    positionUsdc = amount1;
-                }
-            }
-
-            if (assetIsToken0) {
-                positionUsdc += tokensOwed0;
-                positionWeth += tokensOwed1;
-            } else {
-                positionWeth += tokensOwed0;
-                positionUsdc += tokensOwed1;
-            }
-        }
+        (uint256 positionUsdc, uint256 positionWeth) = _positionValue();
 
         uint256 totalWeth = idleWeth + positionWeth;
         uint256 wethValueInUsdc = totalWeth == 0 ? 0 : _wethToUsdc(totalWeth);
 
         return idleUsdc + positionUsdc + wethValueInUsdc;
+    }
+
+    /// @dev Split out of totalAssets() specifically to avoid a "stack too
+    ///      deep" compiler error — positions() alone returns 12 fields, and
+    ///      keeping that live alongside totalAssets()'s other variables
+    ///      exceeded the EVM's local-variable stack limit. Each function call
+    ///      gets its own fresh stack, so splitting the work (rather than
+    ///      switching on the --via-ir compiler flag) fixes it without
+    ///      changing any of the actual math.
+    function _positionValue() private view returns (uint256 positionUsdc, uint256 positionWeth) {
+        uint256 tokenId = currentPositionTokenId;
+        if (tokenId == 0) return (0, 0);
+
+        (, , , , , int24 tickLower, int24 tickUpper, uint128 liquidity, , , uint128 tokensOwed0, uint128 tokensOwed1) =
+            positionManager.positions(tokenId);
+
+        if (liquidity > 0) {
+            (uint256 amount0, uint256 amount1) = _liquidityValue(tickLower, tickUpper, liquidity);
+            if (assetIsToken0) {
+                positionUsdc = amount0;
+                positionWeth = amount1;
+            } else {
+                positionWeth = amount0;
+                positionUsdc = amount1;
+            }
+        }
+
+        if (assetIsToken0) {
+            positionUsdc += tokensOwed0;
+            positionWeth += tokensOwed1;
+        } else {
+            positionWeth += tokensOwed0;
+            positionUsdc += tokensOwed1;
+        }
+    }
+
+    /// @dev Also split out for the same stack-depth reason — isolates the
+    ///      slot0() read and the tick->sqrtPrice conversions from everything
+    ///      else in _positionValue().
+    function _liquidityValue(int24 tickLower, int24 tickUpper, uint128 liquidity)
+        private
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        return _getAmountsForLiquidity(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            liquidity
+        );
     }
 
     function _sortedTokens() private view returns (address token0, address token1) {
