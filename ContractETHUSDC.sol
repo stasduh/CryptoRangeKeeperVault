@@ -344,9 +344,37 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         revert DirectDepositNotAllowed();
     }
 
-    // withdraw() / redeem() are intentionally left as the standard, ungated
-    // ERC4626 implementation — the AML check happens on the way IN, not on
-    // withdrawal.
+    // withdraw() / redeem() are intentionally left ungated (unlike deposit) —
+    // the AML check happens on the way IN, not on withdrawal. Both funnel
+    // through ERC4626's internal _withdraw() hook below, which is where the
+    // "pull from the open position if idle balance is short" logic lives —
+    // so both functions get it automatically, no separate override needed
+    // for each.
+
+    /// @dev Standard ERC4626 withdrawal just transfers `assets` straight out
+    ///      of the contract's own balance — which fails once funds are
+    ///      parked in an open Uniswap position instead of sitting idle as
+    ///      plain USDC (confirmed by testing: reverts with "ERC20: transfer
+    ///      amount exceeds balance"). If idle balance is short, this closes
+    ///      the ENTIRE current position first (not just the needed slice —
+    ///      partial withdrawal would need proportional-liquidity math, more
+    ///      moving parts to get wrong) so the transfer below has enough to
+    ///      work with. The keeper's next scheduled rebalance() reopens a
+    ///      position from whatever's left.
+    function _withdraw(
+        address caller,
+        address receiver,
+        address owner_,
+        uint256 assets,
+        uint256 shares
+    ) internal override {
+        uint256 idleBalance = IERC20(asset()).balanceOf(address(this));
+        if (idleBalance < assets && currentPositionTokenId != 0) {
+            _closeOldPosition(currentPositionTokenId);
+            currentPositionTokenId = 0; // fully closed; keeper reopens on its next cycle
+        }
+        super._withdraw(caller, receiver, owner_, assets, shares);
+    }
 
     /// @notice Moves the vault's liquidity to a new tick range. Called by the
     ///         keeper bot roughly once an hour. Deliberately does NOT
