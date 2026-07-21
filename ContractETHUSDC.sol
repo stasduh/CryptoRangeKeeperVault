@@ -189,6 +189,14 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
     ///         0 means no open position yet.
     uint256 public currentPositionTokenId;
 
+    /// @notice Cumulative performance fees ever sent to feeRecipient, tracked
+    ///         separately per token since fees are paid in whichever token
+    ///         they were earned in (WETH, USDC, or a mix), never converted.
+    ///         Kept on-chain specifically so this number isn't something
+    ///         only the backend claims — anyone can read it directly.
+    uint256 public totalFeesCollectedUsdc;
+    uint256 public totalFeesCollectedWeth;
+
     /// @dev Internal one-shot gate: set true only for the duration of the
     ///      depositWithAmlCheck() call, so the inherited deposit()/mint()
     ///      can't be called directly without going through the AML check.
@@ -468,6 +476,15 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
             (address token0, address token1) = _sortedTokens();
             if (feeAmount0 > 0) IERC20(token0).safeTransfer(feeRecipient, feeAmount0);
             if (feeAmount1 > 0) IERC20(token1).safeTransfer(feeRecipient, feeAmount1);
+
+            if (assetIsToken0) {
+                totalFeesCollectedUsdc += feeAmount0;
+                totalFeesCollectedWeth += feeAmount1;
+            } else {
+                totalFeesCollectedWeth += feeAmount0;
+                totalFeesCollectedUsdc += feeAmount1;
+            }
+
             emit PerformanceFeeCollected(feeAmount0, feeAmount1);
         }
     }
