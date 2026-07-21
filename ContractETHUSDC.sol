@@ -547,6 +547,30 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         return idleUsdc + positionUsdc + wethValueInUsdc;
     }
 
+    /// @notice Full breakdown of vault value — how much USDC, how much WETH,
+    ///         each in its own native units (not converted). Adds idle
+    ///         balances (sitting directly on the contract) to whatever's in
+    ///         the open Uniswap position. Reuses the same _positionValue()
+    ///         that totalAssets() already relies on — no new math, just a
+    ///         different way of reading the same numbers, for the site to
+    ///         show "X USDC / Y ETH" instead of one combined dollar figure.
+    function vaultBalances() external view returns (uint256 usdcAmount, uint256 wethAmount) {
+        uint256 idleUsdc = IERC20(asset()).balanceOf(address(this));
+        uint256 idleWeth = pairToken.balanceOf(address(this));
+        (uint256 positionUsdc, uint256 positionWeth) = _positionValue();
+        usdcAmount = idleUsdc + positionUsdc;
+        wethAmount = idleWeth + positionWeth;
+    }
+
+    /// @notice Cumulative performance fees ever sent to feeRecipient,
+    ///         expressed as one USD-equivalent figure (the WETH portion
+    ///         converted at the pool's current price) — for a single
+    ///         "fees earned" number on the site instead of two separate
+    ///         per-token totals.
+    function totalFeesCollectedUsdValue() external view returns (uint256) {
+        return totalFeesCollectedUsdc + (totalFeesCollectedWeth == 0 ? 0 : _wethToUsdc(totalFeesCollectedWeth));
+    }
+
     /// @dev Split out of totalAssets() specifically to avoid a "stack too
     ///      deep" compiler error — positions() alone returns 12 fields, and
     ///      keeping that live alongside totalAssets()'s other variables
