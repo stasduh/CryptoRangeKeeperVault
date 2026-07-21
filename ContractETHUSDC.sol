@@ -196,9 +196,24 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
 
     uint256 private constant Q96 = 2 ** 96;
 
+    /// @notice Cut of *earned trading fees* (not principal, not deposits,
+    ///         not withdrawals) sent to feeRecipient — in basis points
+    ///         (500 = 5%). Computed from the Uniswap position's
+    ///         tokensOwed0/tokensOwed1, read BEFORE any liquidity is removed
+    ///         on a given close — that field only ever holds accrued trading
+    ///         fees at that point (see _closeOldPosition for why).
+    uint256 public performanceFeeBps = 500;
+
+    /// @notice Sanity ceiling on performanceFeeBps — even the owner can't set
+    ///         it above this, so a compromised or careless owner key can't
+    ///         redirect most/all of the yield.
+    uint256 public constant MAX_PERFORMANCE_FEE_BPS = 3000; // 30%
+
     event AmlSignerUpdated(address indexed oldSigner, address indexed newSigner);
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
     event KeeperUpdated(address indexed oldKeeper, address indexed newKeeper);
+    event PerformanceFeeUpdated(uint256 oldBps, uint256 newBps);
+    event PerformanceFeeCollected(uint256 feeToken0, uint256 feeToken1);
     event AmlDeposit(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
     event Rebalanced(
         uint256 indexed oldTokenId,
@@ -215,6 +230,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
     error ZeroAddress();
     error DuplicateRoleAddress();
     error NotKeeper();
+    error FeeTooHigh();
 
     modifier onlyKeeper() {
         if (msg.sender != keeper) revert NotKeeper();
@@ -286,6 +302,14 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         if (newRecipient == owner() || newRecipient == amlSigner || newRecipient == keeper) revert DuplicateRoleAddress();
         emit FeeRecipientUpdated(feeRecipient, newRecipient);
         feeRecipient = newRecipient;
+    }
+
+    /// @notice Update the performance fee taken from earned trading fees.
+    ///         Capped at MAX_PERFORMANCE_FEE_BPS regardless of who calls this.
+    function setPerformanceFeeBps(uint256 newBps) external onlyOwner {
+        if (newBps > MAX_PERFORMANCE_FEE_BPS) revert FeeTooHigh();
+        emit PerformanceFeeUpdated(performanceFeeBps, newBps);
+        performanceFeeBps = newBps;
     }
 
     /// @notice Update the keeper bot's wallet (e.g. rotating to a new server).
@@ -400,11 +424,24 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
     }
 
     /// @dev Split out of rebalance() to keep local-variable counts down in
-    ///      each function ("stack too deep" otherwise) — no logic changed,
-    ///      just isolated. Pulls all liquidity out of the old position and
-    ///      collects it (+ any accrued fees) back onto this contract.
+    ///      each function ("stack too deep" otherwise) — also shared with
+    ///      _withdraw() when it needs to dip into the position.
+    ///
+    ///      Also where the performance fee is taken — and ONLY here, from
+    ///      the position's tokensOwed0/tokensOwed1, read BEFORE
+    ///      decreaseLiquidity() is called. That field holds exclusively
+    ///      accrued trading fees at this point: the only place this
+    ///      contract ever calls decreaseLiquidity() is right below, always
+    ///      immediately followed by collect() in the same call — so there's
+    ///      never a prior uncollected principal sitting in tokensOwed to
+    ///      accidentally tax. Deposits and withdrawals never touch this
+    ///      function's fee logic at all.
     function _closeOldPosition(uint256 oldTokenId) private {
-        (, , , , , , , uint128 liquidity, , , ,) = positionManager.positions(oldTokenId);
+        (, , , , , , , uint128 liquidity, , , uint128 tokensOwed0, uint128 tokensOwed1) =
+            positionManager.positions(oldTokenId);
+
+        uint256 feeAmount0 = (uint256(tokensOwed0) * performanceFeeBps) / 10000;
+        uint256 feeAmount1 = (uint256(tokensOwed1) * performanceFeeBps) / 10000;
 
         if (liquidity > 0) {
             positionManager.decreaseLiquidity(
@@ -426,6 +463,13 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
                 amount1Max: type(uint128).max
             })
         );
+
+        if (feeAmount0 > 0 || feeAmount1 > 0) {
+            (address token0, address token1) = _sortedTokens();
+            if (feeAmount0 > 0) IERC20(token0).safeTransfer(feeRecipient, feeAmount0);
+            if (feeAmount1 > 0) IERC20(token1).safeTransfer(feeRecipient, feeAmount1);
+            emit PerformanceFeeCollected(feeAmount0, feeAmount1);
+        }
     }
 
     /// @dev Also split out for the same stack-depth reason — mints a fresh
