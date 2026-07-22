@@ -7,6 +7,7 @@ import "@openzeppelin/contracts@5.6.1/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts@5.6.1/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts@5.6.1/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts@5.6.1/access/Ownable.sol";
+import "@openzeppelin/contracts@5.6.1/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts@5.6.1/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts@5.6.1/utils/cryptography/MessageHashUtils.sol";
 
@@ -134,7 +135,7 @@ interface IUniswapV3PoolMinimal {
 ///
 ///      NOT AUDITED. Deploy to testnet (Arbitrum Sepolia) first. Do not put
 ///      real user funds behind this without a professional security review.
-contract CryptoRangeKeeperVault is ERC4626, Ownable {
+contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     using ECDSA for bytes32;
     using SafeERC20 for IERC20;
 
@@ -399,7 +400,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
         address owner_,
         uint256 assets,
         uint256 shares
-    ) internal override {
+    ) internal override nonReentrant {
         uint256 idleBalance = IERC20(asset()).balanceOf(address(this));
         if (idleBalance < assets && currentPositionTokenId != 0) {
             _closeOldPosition(currentPositionTokenId);
@@ -417,7 +418,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable {
     ///      always return real tokens to this contract regardless of the new
     ///      range — there's no recipient parameter it controls pointing
     ///      outside this contract.
-    function rebalance(int24 tickLower, int24 tickUpper) external onlyKeeper {
+    function rebalance(int24 tickLower, int24 tickUpper) external onlyKeeper nonReentrant {
         uint256 oldTokenId = currentPositionTokenId;
 
         if (oldTokenId != 0) {
