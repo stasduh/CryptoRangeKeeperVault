@@ -36,7 +36,7 @@ Tracks each investor's share and holds a single concentrated position via Uniswa
 03
 Keeper Bot
 Node.js · Cron · PostgreSQL
-Checks the price tick every hour and calls rebalance() or harvest(). The database stores only analytics — no keys, no funds.
+Checks the price tick every rebalance(). The database stores only analytics — no keys, no funds.
 
 ```
 
