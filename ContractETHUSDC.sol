@@ -195,8 +195,21 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///         they were earned in (WETH, USDC, or a mix), never converted.
     ///         Kept on-chain specifically so this number isn't something
     ///         only the backend claims — anyone can read it directly.
+    ///         NOTE: this is the SERVICE'S cut (performanceFeeBps), not the
+    ///         depositors' total yield — see totalYieldEarnedUsdc/Weth below
+    ///         for the number meant to be shown to users on the site.
     uint256 public totalFeesCollectedUsdc;
     uint256 public totalFeesCollectedWeth;
+
+    /// @notice Cumulative GROSS yield ever earned from providing liquidity
+    ///         (100% of accrued trading fees, before the service's cut is
+    ///         taken out) — this is what depositors collectively earned,
+    ///         and the number meant to be shown publicly on the site as
+    ///         "fees earned". Tracked the same way as totalFeesCollected*
+    ///         above (read from tokensOwed0/1 before any liquidity is
+    ///         touched), just without the performanceFeeBps cut applied.
+    uint256 public totalYieldEarnedUsdc;
+    uint256 public totalYieldEarnedWeth;
 
     /// @dev Internal one-shot gate: set true only for the duration of the
     ///      depositWithAmlCheck() call, so the inherited deposit()/mint()
@@ -452,6 +465,19 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         uint256 feeAmount0 = (uint256(tokensOwed0) * performanceFeeBps) / 10000;
         uint256 feeAmount1 = (uint256(tokensOwed1) * performanceFeeBps) / 10000;
 
+        // Валовой доход от ликвидности — 100% накопленного (tokensOwed),
+        // ДО вычета комиссии сервиса. Это и есть число, которое положено
+        // показывать публично на сайте — не то, что уходит feeRecipient.
+        if (tokensOwed0 > 0 || tokensOwed1 > 0) {
+            if (assetIsToken0) {
+                totalYieldEarnedUsdc += tokensOwed0;
+                totalYieldEarnedWeth += tokensOwed1;
+            } else {
+                totalYieldEarnedWeth += tokensOwed0;
+                totalYieldEarnedUsdc += tokensOwed1;
+            }
+        }
+
         if (liquidity > 0) {
             positionManager.decreaseLiquidity(
                 INonfungiblePositionManager.DecreaseLiquidityParams({
@@ -565,11 +591,19 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
 
     /// @notice Cumulative performance fees ever sent to feeRecipient,
     ///         expressed as one USD-equivalent figure (the WETH portion
-    ///         converted at the pool's current price) — for a single
-    ///         "fees earned" number on the site instead of two separate
-    ///         per-token totals.
+    ///         converted at the pool's current price). This is the
+    ///         SERVICE'S cut — NOT meant to be shown publicly on the site;
+    ///         use totalYieldEarnedUsdValue() below for that instead.
     function totalFeesCollectedUsdValue() external view returns (uint256) {
         return totalFeesCollectedUsdc + (totalFeesCollectedWeth == 0 ? 0 : _wethToUsdc(totalFeesCollectedWeth));
+    }
+
+    /// @notice Cumulative GROSS yield ever earned from providing liquidity
+    ///         (100% of accrued trading fees, before the service's cut),
+    ///         expressed as one USD-equivalent figure — this is the number
+    ///         meant to be shown on the site as "fees earned" for depositors.
+    function totalYieldEarnedUsdValue() external view returns (uint256) {
+        return totalYieldEarnedUsdc + (totalYieldEarnedWeth == 0 ? 0 : _wethToUsdc(totalYieldEarnedWeth));
     }
 
     /// @dev Split out of totalAssets() specifically to avoid a "stack too
