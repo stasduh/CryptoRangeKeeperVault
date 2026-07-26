@@ -17,7 +17,7 @@
 - ⚡ **Optimal Gas Execution:** Uses off-chain monitoring triggers paired with secure, gas-efficient smart contract calls to execute rebalances only when economically viable.
 - 🛡️ **Non-Custodial & Permissionless:** Users retain full ownership of their underlying tokens. Positions can be withdrawn or adjusted at any time.
 - 📊 **Real-Time Analytics Dashboard:** Sleek web interface to track active positions, impermanent loss metrics, accrued fee rewards, and historical vault performance.
-- 🔌 **Multi-Wallet Support:** Seamless integration via Wagmi/Viem supporting MetaMask, Coinbase Wallet, WalletConnect, and Rainbow.
+- 🔌 **Multi-Wallet Support:** Reown.
 
 ---
 
