@@ -27,7 +27,7 @@
 01
 DApp
 HTML5 · ethers.js · Bootstrap 5
-Deposits, withdrawals, and yield monitoring. Transactions are signed right in MetaMask / WalletConnect — no backend in between.
+Deposits, withdrawals, and yield monitoring. reown for wallet.
 
 →
 02
@@ -39,7 +39,7 @@ Tracks each investor's share and holds a single concentrated position via Uniswa
 03
 Keeper Bot
 Node.js · Cron · PostgreSQL
-Checks the price tick every rebalance(). The database stores only analytics — no keys, no funds.
+rebalance(). The database stores only analytics — no keys, no funds.
 
 ```
 
@@ -55,8 +55,6 @@ Checks the price tick every rebalance(). The database stores only analytics — 
 - **Non-Custodial Design:** Smart contracts hold no administrative powers to withdraw user funds directly.
 - **Slippage Protection:** All rebalancing swaps enforce maximum acceptable slippage parameters to defend against MEV / sandwich attacks.
 - **Reentrancy Protection:** Built with OpenZeppelin's `ReentrancyGuard`.
-
-> **Note:** Software is provided "as is". Use at your own risk when connecting production wallets.
 
 ---
 
@@ -79,7 +77,7 @@ This project is open-source and licensed under the [MIT License](LICENSE).
 
 **Stas Dukh.**
 - GitHub: [@stasduh](https://github.com/stasduh)
-- Web App: [range-keeper.vercel.app](https://range-keeper.vercel.app/)
+- Web App: [https://cryptorangekeeper.com](https://cryptorangekeeper.com)
 
 ---
 
