@@ -2,7 +2,7 @@
 
 **Crypto Range Keeper Vault** is an automated, non-custodial yield management protocol and Web3 application designed for concentrated liquidity provision (such as Uniswap v3). It continuously monitors concentrated liquidity positions, automatically rebalances out-of-range assets back into optimal earning bands, and auto-compounds trading fees to maximize Capital Efficiency and LP returns.
 
-🌐 **Live Application:** [https://range-keeper.vercel.app/](https://range-keeper.vercel.app/)  
+🌐 **Live Application:** [https://cryptorangekeeper.com/](https://cryptorangekeeper.com/)  
 📂 **GitHub Repository:** [https://github.com/stasduh/CryptoRangeKeeperVault](https://github.com/stasduh/CryptoRangeKeeperVault)
 
 ---
