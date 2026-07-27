@@ -449,16 +449,42 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      each function ("stack too deep" otherwise) — also shared with
     ///      _withdraw() when it needs to dip into the position.
     ///
-    ///      Also where the performance fee is taken — and ONLY here, from
-    ///      the position's tokensOwed0/tokensOwed1, read BEFORE
-    ///      decreaseLiquidity() is called. That field holds exclusively
-    ///      accrued trading fees at this point: the only place this
-    ///      contract ever calls decreaseLiquidity() is right below, always
-    ///      immediately followed by collect() in the same call — so there's
-    ///      never a prior uncollected principal sitting in tokensOwed to
-    ///      accidentally tax. Deposits and withdrawals never touch this
-    ///      function's fee logic at all.
+    ///      Also where the performance fee is taken. IMPORTANT: a plain
+    ///      positionManager.positions() read does NOT return live accrued
+    ///      fees — Uniswap only settles the real tokensOwed0/1 amount into
+    ///      storage when the position is actually "poked" (any call to
+    ///      decreaseLiquidity/increaseLiquidity/collect triggers this
+    ///      internally; see NonfungiblePositionManager.sol's own collect(),
+    ///      which explicitly triggers this update before reading). A bare
+    ///      positions() call otherwise returns whatever was last settled —
+    ///      for a freshly minted position, that's 0, forever, until poked.
+    ///      Confirmed by testing: 12+ real rebalances in a row all recorded
+    ///      exactly 0 accrued fees, despite Uniswap's own UI showing real
+    ///      non-zero uncollected fees on the same live position.
+    ///      Fix: explicitly poke with a ZERO-liquidity decreaseLiquidity()
+    ///      call first — removes nothing, but forces Uniswap to settle the
+    ///      real fee-growth delta into tokensOwed0/1 — THEN read positions()
+    ///      to get the true, current value. Only after that do we call the
+    ///      real (non-zero) decreaseLiquidity() that removes principal —
+    ///      so the read above is still cleanly isolated to fees only, just
+    ///      now an accurate one instead of a stale one.
     function _closeOldPosition(uint256 oldTokenId) private {
+        (, , , , , , , uint128 liquidityBeforePoke, , , , ) = positionManager.positions(oldTokenId);
+
+        if (liquidityBeforePoke > 0) {
+            // Poke: zero-amount decrease, removes no principal, exists only
+            // to force Uniswap to settle real accrued fees into tokensOwed.
+            positionManager.decreaseLiquidity(
+                INonfungiblePositionManager.DecreaseLiquidityParams({
+                    tokenId: oldTokenId,
+                    liquidity: 0,
+                    amount0Min: 0,
+                    amount1Min: 0,
+                    deadline: block.timestamp
+                })
+            );
+        }
+
         (, , , , , , , uint128 liquidity, , , uint128 tokensOwed0, uint128 tokensOwed1) =
             positionManager.positions(oldTokenId);
 
