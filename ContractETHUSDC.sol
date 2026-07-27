@@ -450,62 +450,39 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      _withdraw() when it needs to dip into the position.
     ///
     ///      Also where the performance fee is taken. IMPORTANT: a plain
-    ///      positionManager.positions() read does NOT return live accrued
-    ///      fees — Uniswap only settles the real tokensOwed0/1 amount into
-    ///      storage when the position is actually "poked" (any call to
-    ///      decreaseLiquidity/increaseLiquidity/collect triggers this
-    ///      internally; see NonfungiblePositionManager.sol's own collect(),
-    ///      which explicitly triggers this update before reading). A bare
-    ///      positions() call otherwise returns whatever was last settled —
-    ///      for a freshly minted position, that's 0, forever, until poked.
-    ///      Confirmed by testing: 12+ real rebalances in a row all recorded
-    ///      exactly 0 accrued fees, despite Uniswap's own UI showing real
-    ///      non-zero uncollected fees on the same live position.
-    ///      Fix: explicitly poke with a ZERO-liquidity decreaseLiquidity()
-    ///      call first — removes nothing, but forces Uniswap to settle the
-    ///      real fee-growth delta into tokensOwed0/1 — THEN read positions()
-    ///      to get the true, current value. Only after that do we call the
-    ///      real (non-zero) decreaseLiquidity() that removes principal —
-    ///      so the read above is still cleanly isolated to fees only, just
-    ///      now an accurate one instead of a stale one.
+    ///      positionManager.positions() read BEFORE any liquidity change
+    ///      does NOT return live accrued fees — Uniswap only settles the
+    ///      real tokensOwed0/1 amount into storage when the position is
+    ///      actually touched (mint/decreaseLiquidity/collect all trigger
+    ///      this internally). Confirmed by testing: 12+ real rebalances in
+    ///      a row all recorded exactly 0 accrued fees despite Uniswap's own
+    ///      UI showing real non-zero uncollected fees on the same position.
+    ///
+    ///      An earlier version of this fix tried to force-settle fees with
+    ///      a zero-liquidity decreaseLiquidity() "poke" beforehand — that
+    ///      turned out to be invalid: NonfungiblePositionManager's own
+    ///      decreaseLiquidity() has `require(params.liquidity > 0)` as its
+    ///      very first line, so a zero-amount call always reverts. Confirmed
+    ///      directly in Uniswap's v3-periphery source before settling on
+    ///      the fix below — this broke rebalance() entirely for a few hours
+    ///      in production before being caught and reverted.
+    ///
+    ///      Correct fix: decreaseLiquidity() itself already settles real
+    ///      fees into tokensOwed as a side effect of removing the full
+    ///      liquidity — no separate poke needed. It also RETURNS the exact
+    ///      principal amounts (amount0, amount1) being removed. Reading
+    ///      tokensOwed0/1 AFTER that call gives (fees + just-removed
+    ///      principal) mixed together — subtracting the returned principal
+    ///      amounts isolates the real fee portion cleanly, using data we
+    ///      already have for free, no extra external call required.
     function _closeOldPosition(uint256 oldTokenId) private {
-        (, , , , , , , uint128 liquidityBeforePoke, , , , ) = positionManager.positions(oldTokenId);
+        (, , , , , , , uint128 liquidity, , , , ) = positionManager.positions(oldTokenId);
 
-        if (liquidityBeforePoke > 0) {
-            // Poke: zero-amount decrease, removes no principal, exists only
-            // to force Uniswap to settle real accrued fees into tokensOwed.
-            positionManager.decreaseLiquidity(
-                INonfungiblePositionManager.DecreaseLiquidityParams({
-                    tokenId: oldTokenId,
-                    liquidity: 0,
-                    amount0Min: 0,
-                    amount1Min: 0,
-                    deadline: block.timestamp
-                })
-            );
-        }
-
-        (, , , , , , , uint128 liquidity, , , uint128 tokensOwed0, uint128 tokensOwed1) =
-            positionManager.positions(oldTokenId);
-
-        uint256 feeAmount0 = (uint256(tokensOwed0) * performanceFeeBps) / 10000;
-        uint256 feeAmount1 = (uint256(tokensOwed1) * performanceFeeBps) / 10000;
-
-        // Валовой доход от ликвидности — 100% накопленного (tokensOwed),
-        // ДО вычета комиссии сервиса. Это и есть число, которое положено
-        // показывать публично на сайте — не то, что уходит feeRecipient.
-        if (tokensOwed0 > 0 || tokensOwed1 > 0) {
-            if (assetIsToken0) {
-                totalYieldEarnedUsdc += tokensOwed0;
-                totalYieldEarnedWeth += tokensOwed1;
-            } else {
-                totalYieldEarnedWeth += tokensOwed0;
-                totalYieldEarnedUsdc += tokensOwed1;
-            }
-        }
+        uint256 principal0;
+        uint256 principal1;
 
         if (liquidity > 0) {
-            positionManager.decreaseLiquidity(
+            (principal0, principal1) = positionManager.decreaseLiquidity(
                 INonfungiblePositionManager.DecreaseLiquidityParams({
                     tokenId: oldTokenId,
                     liquidity: liquidity,
@@ -514,6 +491,31 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
                     deadline: block.timestamp
                 })
             );
+        }
+
+        (, , , , , , , , , , uint128 tokensOwed0After, uint128 tokensOwed1After) =
+            positionManager.positions(oldTokenId);
+
+        // tokensOwed теперь = реальные комиссии + только что снятое тело —
+        // вычитаем тело (знаем его точно из возврата decreaseLiquidity выше),
+        // получаем чистую сумму именно комиссий.
+        uint256 feeAmount0Gross = uint256(tokensOwed0After) > principal0 ? uint256(tokensOwed0After) - principal0 : 0;
+        uint256 feeAmount1Gross = uint256(tokensOwed1After) > principal1 ? uint256(tokensOwed1After) - principal1 : 0;
+
+        uint256 feeAmount0 = (feeAmount0Gross * performanceFeeBps) / 10000;
+        uint256 feeAmount1 = (feeAmount1Gross * performanceFeeBps) / 10000;
+
+        // Валовой доход от ликвидности — 100% накопленного (до вычета
+        // комиссии сервиса). Это и есть число, которое положено показывать
+        // публично на сайте — не то, что уходит feeRecipient.
+        if (feeAmount0Gross > 0 || feeAmount1Gross > 0) {
+            if (assetIsToken0) {
+                totalYieldEarnedUsdc += feeAmount0Gross;
+                totalYieldEarnedWeth += feeAmount1Gross;
+            } else {
+                totalYieldEarnedWeth += feeAmount0Gross;
+                totalYieldEarnedUsdc += feeAmount1Gross;
+            }
         }
 
         positionManager.collect(
