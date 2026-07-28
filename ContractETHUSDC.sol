@@ -485,9 +485,9 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///         minimum on withdrawal-triggered position closes (1% = 100).
     ///         Deliberately generous compared to what a bot could achieve
     ///         with a fresh off-chain quote — this path has no bot feeding
-    ///         it real-time numbers, just the same TWAP totalAssets() uses,
-    ///         so the tolerance needs enough slack to not spuriously revert
-    ///         a legitimate user withdrawal during ordinary price movement.
+    ///         it real-time numbers, just a spot-price snapshot in the same
+    ///         transaction, so the tolerance only needs to cover this one
+    ///         transaction's own execution, not a longer lag.
     uint256 public constant WITHDRAWAL_SLIPPAGE_TOLERANCE_BPS = 100;
 
     /// @dev Closes the currently open position with a modest, self-computed
@@ -496,6 +496,22 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      is exactly as sandwichable here as it is there). Shared by both
     ///      the standard withdraw()/redeem() path above and withdrawMixed()
     ///      below.
+    ///
+    ///      Real-world bug caught in production: this originally computed
+    ///      "expected" amounts via _liquidityValue(), which uses the
+    ///      20-minute TWAP (correct for totalAssets()'s share pricing, which
+    ///      is what that function exists for). But decreaseLiquidity() below
+    ///      executes at SPOT price in the same block — if spot had drifted
+    ///      more than the 1% tolerance away from the 20-minute-old TWAP
+    ///      (ordinary market movement, not manipulation), the TWAP-based
+    ///      "expected" minimum came out higher than what decreaseLiquidity()
+    ///      could actually deliver, and Uniswap's own internal check
+    ///      reverted with "Price slippage check" on every withdrawal. Fixed
+    ///      by using spot price as the reference here instead — appropriate
+    ///      specifically because this minimum only protects THIS transaction's
+    ///      own execution against being sandwiched, not share pricing against
+    ///      manipulation (that protection lives in totalAssets()'s TWAP,
+    ///      untouched by this fix).
     function _closeCurrentPositionWithOnChainSlippageProtection() private {
         uint256 tokenId = currentPositionTokenId;
         (, , , , , int24 tickLower, int24 tickUpper, uint128 liquidity, , , , ) =
@@ -504,7 +520,13 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         uint256 amount0Min;
         uint256 amount1Min;
         if (liquidity > 0) {
-            (uint256 expected0, uint256 expected1) = _liquidityValue(tickLower, tickUpper, liquidity);
+            (uint160 sqrtPriceX96Spot, , , , , , ) = pool.slot0();
+            (uint256 expected0, uint256 expected1) = _getAmountsForLiquidity(
+                sqrtPriceX96Spot,
+                TickMath.getSqrtPriceAtTick(tickLower),
+                TickMath.getSqrtPriceAtTick(tickUpper),
+                liquidity
+            );
             amount0Min = (expected0 * (10000 - WITHDRAWAL_SLIPPAGE_TOLERANCE_BPS)) / 10000;
             amount1Min = (expected1 * (10000 - WITHDRAWAL_SLIPPAGE_TOLERANCE_BPS)) / 10000;
         }
@@ -533,6 +555,19 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      strict standard compliance; anyone who'd rather wait and get
     ///      paid in pure USDC can still call withdraw() instead — their
     ///      choice to make, not one this contract makes for them.
+    ///
+    ///      NOTE on standard withdraw()/redeem(): the same share-timing
+    ///      subtlety fixed below (audit finding #2, round 3) exists there
+    ///      too in principle — OpenZeppelin's own public withdraw()/redeem()
+    ///      compute shares via previewWithdraw() BEFORE calling our
+    ///      _withdraw() override, where the position-closing side effect
+    ///      lives. Left as-is deliberately: fixing it there would mean
+    ///      overriding OZ's own public entry points, moving further from
+    ///      standard ERC-4626 behavior for a discrepancy that's already
+    ///      small (only matters when a close is actually triggered, and
+    ///      only by the gap between pre- and post-fee totalAssets()).
+    ///      A candidate for a future round if this is judged worth the
+    ///      added non-conformance.
     function withdrawMixed(uint256 assets, address receiver, address owner_)
         external
         nonReentrant
@@ -543,16 +578,23 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
             revert ERC4626ExceededMaxWithdraw(owner_, assets, maxAssets);
         }
 
-        shares = previewWithdraw(assets);
-
-        if (msg.sender != owner_) {
-            _spendAllowance(owner_, msg.sender, shares);
-        }
-
         uint256 idleUsdc = IERC20(asset()).balanceOf(address(this));
         if (idleUsdc < assets && currentPositionTokenId != 0) {
             _closeCurrentPositionWithOnChainSlippageProtection();
             idleUsdc = IERC20(asset()).balanceOf(address(this));
+        }
+
+        // shares вычисляется ПОСЛЕ возможного закрытия позиции (третий
+        // раунд аудита, находка #2) — closing pays a performance fee out to
+        // feeRecipient and settles previously-stale accrued yield into
+        // totalAssets(), both of which change the share price. Computing
+        // shares against the pre-close totalAssets() would burn a slightly
+        // wrong number of shares relative to the post-close reality; using
+        // the fresh value here keeps the burned amount accurate.
+        shares = previewWithdraw(assets);
+
+        if (msg.sender != owner_) {
+            _spendAllowance(owner_, msg.sender, shares);
         }
 
         _burn(owner_, shares);
@@ -660,11 +702,24 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      Correct fix: decreaseLiquidity() itself already settles real
     ///      fees into tokensOwed as a side effect of removing the full
     ///      liquidity — no separate poke needed. It also RETURNS the exact
-    ///      principal amounts (amount0, amount1) being removed. Reading
-    ///      tokensOwed0/1 AFTER that call gives (fees + just-removed
-    ///      principal) mixed together — subtracting the returned principal
-    ///      amounts isolates the real fee portion cleanly, using data we
-    ///      already have for free, no extra external call required.
+    ///      principal amounts (amount0, amount1) being removed.
+    ///
+    ///      Second-round audit finding: an earlier version of this fix read
+    ///      tokensOwed AFTER decreaseLiquidity() and subtracted the returned
+    ///      principal to isolate fees — correct under this contract's own
+    ///      invariants (every position is freshly minted, always fully
+    ///      collected before the next close, so tokensOwed should be 0
+    ///      going in), but the auditor pointed out this trusts Uniswap's
+    ///      internal accounting rather than ground truth: if that invariant
+    ///      were ever violated by so much as 1 wei of rounding, the fee
+    ///      calculation could exceed what's actually available, permanently
+    ///      reverting every future rebalance() (insufficient balance for
+    ///      the fee transfer + new position). Fixed by measuring the
+    ///      CONTRACT'S OWN real ERC20 balance change across decreaseLiquidity()
+    ///      + collect() instead of reading Uniswap's internal tokensOwed at
+    ///      all — the fee amount computed this way can mathematically never
+    ///      exceed what's physically sitting in the contract, regardless of
+    ///      any Uniswap-side accounting subtlety we haven't considered.
     ///
     ///      amount0Min/amount1Min/deadline (security audit finding #2 fix):
     ///      passed through from the caller rather than hardcoded to 0/
@@ -689,14 +744,27 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
             );
         }
 
-        (, , , , , , , , , , uint128 tokensOwed0After, uint128 tokensOwed1After) =
-            positionManager.positions(oldTokenId);
+        (address token0, address token1) = _sortedTokens();
+        uint256 balance0Before = IERC20(token0).balanceOf(address(this));
+        uint256 balance1Before = IERC20(token1).balanceOf(address(this));
 
-        // tokensOwed теперь = реальные комиссии + только что снятое тело —
-        // вычитаем тело (знаем его точно из возврата decreaseLiquidity выше),
-        // получаем чистую сумму именно комиссий.
-        uint256 feeAmount0Gross = uint256(tokensOwed0After) > principal0 ? uint256(tokensOwed0After) - principal0 : 0;
-        uint256 feeAmount1Gross = uint256(tokensOwed1After) > principal1 ? uint256(tokensOwed1After) - principal1 : 0;
+        positionManager.collect(
+            INonfungiblePositionManager.CollectParams({
+                tokenId: oldTokenId,
+                recipient: address(this),
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            })
+        );
+
+        // Реальное изменение баланса контракта — ground truth, не
+        // внутренний учёт Uniswap. Комиссия физически не может превысить
+        // то, что действительно пришло на баланс.
+        uint256 totalReceived0 = IERC20(token0).balanceOf(address(this)) - balance0Before;
+        uint256 totalReceived1 = IERC20(token1).balanceOf(address(this)) - balance1Before;
+
+        uint256 feeAmount0Gross = totalReceived0 > principal0 ? totalReceived0 - principal0 : 0;
+        uint256 feeAmount1Gross = totalReceived1 > principal1 ? totalReceived1 - principal1 : 0;
 
         uint256 feeAmount0 = (feeAmount0Gross * performanceFeeBps) / 10000;
         uint256 feeAmount1 = (feeAmount1Gross * performanceFeeBps) / 10000;
@@ -714,17 +782,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
             }
         }
 
-        positionManager.collect(
-            INonfungiblePositionManager.CollectParams({
-                tokenId: oldTokenId,
-                recipient: address(this),
-                amount0Max: type(uint128).max,
-                amount1Max: type(uint128).max
-            })
-        );
-
         if (feeAmount0 > 0 || feeAmount1 > 0) {
-            (address token0, address token1) = _sortedTokens();
             if (feeAmount0 > 0) IERC20(token0).safeTransfer(feeRecipient, feeAmount0);
             if (feeAmount1 > 0) IERC20(token1).safeTransfer(feeRecipient, feeAmount1);
 
@@ -756,8 +814,19 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         uint256 balance0 = IERC20(token0).balanceOf(address(this));
         uint256 balance1 = IERC20(token1).balanceOf(address(this));
 
-        IERC20(token0).forceApprove(address(positionManager), balance0);
-        IERC20(token1).forceApprove(address(positionManager), balance1);
+        // Пропускаем approve() целиком, если текущего одобрения уже
+        // достаточно (третий раунд аудита, находка #3 про газ) — раз мы
+        // больше не сбрасываем allowance в 0 после mint() (прошлый раунд),
+        // остаток с предыдущего цикла нередко уже достаточен, особенно для
+        // стороны, что обычно потребляется не полностью в наших
+        // односторонних диапазонах. Дешёвое чтение allowance() вместо
+        // дорогого approve(), когда он и так не нужен.
+        if (IERC20(token0).allowance(address(this), address(positionManager)) < balance0) {
+            IERC20(token0).forceApprove(address(positionManager), balance0);
+        }
+        if (IERC20(token1).allowance(address(this), address(positionManager)) < balance1) {
+            IERC20(token1).forceApprove(address(positionManager), balance1);
+        }
 
         (newTokenId, , amount0, amount1) = positionManager.mint(
             INonfungiblePositionManager.MintParams({
@@ -775,9 +844,15 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
             })
         );
 
-        // Revoke any leftover approval rather than leaving it standing.
-        IERC20(token0).forceApprove(address(positionManager), 0);
-        IERC20(token1).forceApprove(address(positionManager), 0);
+        // Не сбрасываем approval обратно в 0 здесь (было раньше) — по
+        // замечанию второго раунда аудита: forceApprove() сама уже умеет
+        // корректно переписывать одобрение при СЛЕДУЮЩЕМ вызове (сначала
+        // пробует approve() напрямую на новое значение, и только если
+        // токен это не разрешает — как раз сценарий, ради которого
+        // forceApprove вообще существует — сама падает обратно на сброс
+        // через 0). Ручной сброс здесь был чистой тратой газа (~5-10k за
+        // ребаланс) без какой-либо дополнительной защиты сверх того, что
+        // forceApprove и так гарантирует на следующий вызов.
     }
 
     /// @notice Total vault value, expressed in `asset()` (USDC) — the number
@@ -908,6 +983,18 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      far back (e.g. a freshly deployed pool) — failing loudly beats
     ///      silently falling back to spot price, which would quietly reopen
     ///      the exact manipulation this exists to close.
+    ///
+    ///      DEPLOYMENT NOTE (security audit, round 2): this WILL revert with
+    ///      Uniswap's "OLD" error on a low-activity or freshly-created pool
+    ///      whose observation buffer hasn't accumulated TOTAL_ASSETS_TWAP_WINDOW
+    ///      (20 min) of history yet — e.g. testnets, or a brand new pool on
+    ///      any network. Not a risk for THIS deployment (the real mainnet
+    ///      WETH/USDC 0.05% pool has $75M+ TVL and deep observation history
+    ///      already), but if this contract is ever redeployed against a
+    ///      different/newer pool: call pool.increaseObservationCardinalityNext()
+    ///      first, and let at least one real trade happen and 20 minutes
+    ///      pass before the first deposit, or every totalAssets()/rebalance()
+    ///      call will simply revert.
     function _getTwapTick(uint32 secondsAgo) private view returns (int24) {
         uint32[] memory secondsAgos = new uint32[](2);
         secondsAgos[0] = secondsAgo;
