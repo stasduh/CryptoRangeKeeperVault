@@ -101,7 +101,7 @@ interface INonfungiblePositionManager {
         );
 }
 
-/// @dev Only the one read this contract needs from the pool itself.
+/// @dev Only the reads this contract needs from the pool itself.
 interface IUniswapV3PoolMinimal {
     function slot0()
         external
@@ -115,6 +115,18 @@ interface IUniswapV3PoolMinimal {
             uint8 feeProtocol,
             bool unlocked
         );
+
+    /// @notice Returns cumulative tick values at each offset in `secondsAgos`
+    ///         — the raw data a TWAP is computed from. Requires the pool's
+    ///         observation buffer to actually hold data going back that far;
+    ///         see increaseObservationCardinalityNext() on the pool if it
+    ///         doesn't (a one-time setup call, not something this contract
+    ///         needs to do itself since Arbitrum's high-volume pools
+    ///         typically already have a deep enough buffer).
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
 }
 
 /// @title CryptoRangeKeeperVault
@@ -231,6 +243,31 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///         redirect most/all of the yield.
     uint256 public constant MAX_PERFORMANCE_FEE_BPS = 3000; // 30%
 
+    // ---- TWAP (security audit findings #1 and #3) ----
+    // Two SEPARATE windows for two different jobs — using one window for
+    // both was considered and rejected: totalAssets() wants a long, hard-
+    // to-manipulate window since it's a value-of-record used to price every
+    // deposit/withdrawal, while the rebalance() range check wants a much
+    // shorter window so it doesn't spuriously reject a bot that reads live
+    // slot0() and rebalances hourly — a 20-minute-lagging reference would
+    // routinely disagree with an honest, fast-moving market.
+    uint32 public constant TOTAL_ASSETS_TWAP_WINDOW = 1200; // 20 minutes — share pricing
+    uint32 public constant RANGE_CHECK_TWAP_WINDOW = 300;   // 5 minutes — rebalance() sanity check
+
+    /// @notice Max allowed distance (in ticks) between either edge of a
+    ///         keeper-proposed range and the 5-minute TWAP tick — roughly
+    ///         ±10% in price terms (ln(1.10)/ln(1.0001) ≈ 953.15, rounded).
+    ///         Exists specifically to bound the damage from a compromised
+    ///         keeper key (see security audit finding #3): even with the
+    ///         private key, an attacker can't push the range out to
+    ///         something like [-887272, 887272] (all-price-range = zero
+    ///         concentration = "Denial of Yield") — every real range this
+    ///         vault ever sets is within a few % of price by design
+    ///         (BUFFER_FAR_PCT tops out at 3% in the bot's own config), so
+    ///         10% leaves generous headroom for honest operation while still
+    ///         catching the actual attack this exists to stop.
+    int24 public constant RANGE_CHECK_TOLERANCE_TICKS = 953;
+
     event AmlSignerUpdated(address indexed oldSigner, address indexed newSigner);
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
     event KeeperUpdated(address indexed oldKeeper, address indexed newKeeper);
@@ -253,6 +290,8 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     error DuplicateRoleAddress();
     error NotKeeper();
     error FeeTooHigh();
+    error RangeTooFarFromTwap();
+    error InsufficientPoolValue();
 
     modifier onlyKeeper() {
         if (msg.sender != keeper) revert NotKeeper();
@@ -386,6 +425,16 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     }
 
     /// @dev mint() is disabled entirely — depositWithAmlCheck() is asset-based.
+    ///      Security audit finding #4c: this technically breaks strict
+    ///      ERC-4626 compliance (external integrators expecting a working
+    ///      mint() will find it always reverts). Deliberate tradeoff, not an
+    ///      oversight: every deposit path has to go through the AML check in
+    ///      depositWithAmlCheck(), and that function is asset-denominated
+    ///      (matches what the off-chain AML signature actually authorizes).
+    ///      A working share-denominated mint() would need its own separate
+    ///      AML-gated wrapper anyway — not worth the added surface area for
+    ///      a path nothing currently needs. Compliance took priority over
+    ///      full standard conformance here.
     function mint(uint256, address) public pure override returns (uint256) {
         revert DirectDepositNotAllowed();
     }
@@ -407,6 +456,17 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      moving parts to get wrong) so the transfer below has enough to
     ///      work with. The keeper's next scheduled rebalance() reopens a
     ///      position from whatever's left.
+    ///
+    ///      Security audit finding #4b: the fee-to-feeRecipient transfer
+    ///      inside _closeOldPosition() above happens before super._withdraw()
+    ///      finishes — strictly not textbook checks-effects-interactions
+    ///      order. Considered reordering, but the position genuinely has to
+    ///      be closed FIRST to produce the USDC this function transfers out,
+    ///      so the fee-transfer can't be moved after without restructuring
+    ///      much more of the flow for no real safety gain: this function is
+    ///      already nonReentrant, and both possible recipients here are
+    ///      plain USDC/WETH — neither has a transfer callback a reentrant
+    ///      call could hook into. Documented rather than force-reordered.
     function _withdraw(
         address caller,
         address receiver,
@@ -416,29 +476,159 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ) internal override nonReentrant {
         uint256 idleBalance = IERC20(asset()).balanceOf(address(this));
         if (idleBalance < assets && currentPositionTokenId != 0) {
-            _closeOldPosition(currentPositionTokenId);
-            currentPositionTokenId = 0; // fully closed; keeper reopens on its next cycle
+            _closeCurrentPositionWithOnChainSlippageProtection();
         }
         super._withdraw(caller, receiver, owner_, assets, shares);
     }
 
+    /// @notice Basis-point tolerance used for the on-chain-computed slippage
+    ///         minimum on withdrawal-triggered position closes (1% = 100).
+    ///         Deliberately generous compared to what a bot could achieve
+    ///         with a fresh off-chain quote — this path has no bot feeding
+    ///         it real-time numbers, just the same TWAP totalAssets() uses,
+    ///         so the tolerance needs enough slack to not spuriously revert
+    ///         a legitimate user withdrawal during ordinary price movement.
+    uint256 public constant WITHDRAWAL_SLIPPAGE_TOLERANCE_BPS = 100;
+
+    /// @dev Closes the currently open position with a modest, self-computed
+    ///      slippage minimum (security audit finding #2's fix extended to
+    ///      the withdrawal path too, not just rebalance() — decreaseLiquidity()
+    ///      is exactly as sandwichable here as it is there). Shared by both
+    ///      the standard withdraw()/redeem() path above and withdrawMixed()
+    ///      below.
+    function _closeCurrentPositionWithOnChainSlippageProtection() private {
+        uint256 tokenId = currentPositionTokenId;
+        (, , , , , int24 tickLower, int24 tickUpper, uint128 liquidity, , , , ) =
+            positionManager.positions(tokenId);
+
+        uint256 amount0Min;
+        uint256 amount1Min;
+        if (liquidity > 0) {
+            (uint256 expected0, uint256 expected1) = _liquidityValue(tickLower, tickUpper, liquidity);
+            amount0Min = (expected0 * (10000 - WITHDRAWAL_SLIPPAGE_TOLERANCE_BPS)) / 10000;
+            amount1Min = (expected1 * (10000 - WITHDRAWAL_SLIPPAGE_TOLERANCE_BPS)) / 10000;
+        }
+
+        _closeOldPosition(tokenId, amount0Min, amount1Min, block.timestamp);
+        currentPositionTokenId = 0; // fully closed; keeper reopens on its next cycle
+    }
+
+    /// @notice Alternative to withdraw() that never reverts due to a
+    ///         temporary USDC shortfall — if idle USDC (after closing the
+    ///         position, same as withdraw() does) isn't enough to cover the
+    ///         full `assets` requested, pays the remainder in WETH at the
+    ///         pool's 20-minute TWAP price, in the SAME transaction, instead
+    ///         of requiring the user to wait for the position to naturally
+    ///         drift back into majority USDC.
+    /// @dev Security audit finding #4a fix (real-world case that prompted
+    ///      this: a user's $19 position closed to $16 USDC + $3-equivalent
+    ///      WETH, and plain withdraw() could only ever pay the USDC part —
+    ///      the WETH portion had no path out of the contract at all until
+    ///      market conditions happened to flip the composition back).
+    ///      Standard withdraw()/redeem() are left completely untouched —
+    ///      external integrators expecting strict single-asset ERC-4626
+    ///      behavior still get it exactly as before. This is simply the
+    ///      path the site itself calls by default, since real depositors
+    ///      value getting their full value back in one transaction over
+    ///      strict standard compliance; anyone who'd rather wait and get
+    ///      paid in pure USDC can still call withdraw() instead — their
+    ///      choice to make, not one this contract makes for them.
+    function withdrawMixed(uint256 assets, address receiver, address owner_)
+        external
+        nonReentrant
+        returns (uint256 shares)
+    {
+        uint256 maxAssets = maxWithdraw(owner_);
+        if (assets > maxAssets) {
+            revert ERC4626ExceededMaxWithdraw(owner_, assets, maxAssets);
+        }
+
+        shares = previewWithdraw(assets);
+
+        if (msg.sender != owner_) {
+            _spendAllowance(owner_, msg.sender, shares);
+        }
+
+        uint256 idleUsdc = IERC20(asset()).balanceOf(address(this));
+        if (idleUsdc < assets && currentPositionTokenId != 0) {
+            _closeCurrentPositionWithOnChainSlippageProtection();
+            idleUsdc = IERC20(asset()).balanceOf(address(this));
+        }
+
+        _burn(owner_, shares);
+
+        if (idleUsdc >= assets) {
+            IERC20(asset()).safeTransfer(receiver, assets);
+        } else {
+            uint256 usdcShortfall = assets - idleUsdc;
+            uint256 wethNeeded = _usdcToWeth(usdcShortfall);
+            uint256 wethAvailable = pairToken.balanceOf(address(this));
+            // Honest revert rather than paying out less than the user asked
+            // for — if the vault genuinely doesn't hold enough combined
+            // value, that's a real shortfall, not something to paper over.
+            if (wethNeeded > wethAvailable) revert InsufficientPoolValue();
+
+            if (idleUsdc > 0) IERC20(asset()).safeTransfer(receiver, idleUsdc);
+            pairToken.safeTransfer(receiver, wethNeeded);
+        }
+
+        emit Withdraw(msg.sender, receiver, owner_, assets, shares);
+    }
+
     /// @notice Moves the vault's liquidity to a new tick range. Called by the
     ///         keeper bot roughly once an hour. Deliberately does NOT
-    ///         re-check timing, the 5%-distance-to-edge trigger, or sanity of
-    ///         the tick values — all of that lives in the off-chain bot.
-    /// @dev A compromised keeper key can burn/re-mint into a badly-chosen
-    ///      range (temporarily inefficient), but decreaseLiquidity()/collect()
-    ///      always return real tokens to this contract regardless of the new
-    ///      range — there's no recipient parameter it controls pointing
-    ///      outside this contract.
-    function rebalance(int24 tickLower, int24 tickUpper) external onlyKeeper nonReentrant {
+    ///         re-check the bot's timing/trigger logic (still off-chain,
+    ///         that part is still fine to trust the bot with).
+    /// @dev Security audit findings #2 and #3 fixed here together:
+    ///
+    ///      #2 (slippage): amount0Min/amount1Min/deadline used to be
+    ///      hardcoded to 0/0/block.timestamp — meaning ANY outsider watching
+    ///      the mempool (no keeper key needed) could sandwich this call,
+    ///      forcing the vault to add/remove liquidity at a manipulated
+    ///      price. Now the bot computes real slippage-tolerant minimums
+    ///      off-chain (typically a small % below the expected amounts at
+    ///      current price) and a real expiry, passed in here for both the
+    ///      close (old position) and open (new position) legs separately,
+    ///      since they're different operations with different expected
+    ///      amounts.
+    ///
+    ///      #3 (keeper power): a compromised keeper key could previously
+    ///      call rebalance() with something like tickLower=-887272,
+    ///      tickUpper=887272 (full-range = zero concentration = capital
+    ///      earns essentially nothing — "Denial of Yield", not theft, but
+    ///      real harm to depositors). Now both edges must fall within
+    ///      RANGE_CHECK_TOLERANCE_TICKS of a SEPARATE, shorter 5-minute
+    ///      TWAP — short enough to track an honestly fast-moving market
+    ///      without spurious reverts, long enough that moving it requires
+    ///      sustained pressure, not one transaction. See the constant's own
+    ///      docstring for why ~10% tolerance was chosen.
+    function rebalance(
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 closeAmount0Min,
+        uint256 closeAmount1Min,
+        uint256 openAmount0Min,
+        uint256 openAmount1Min,
+        uint256 deadline
+    ) external onlyKeeper nonReentrant {
+        int24 twapTick = _getTwapTick(RANGE_CHECK_TWAP_WINDOW);
+        if (
+            tickLower < twapTick - RANGE_CHECK_TOLERANCE_TICKS ||
+            tickLower > twapTick + RANGE_CHECK_TOLERANCE_TICKS ||
+            tickUpper < twapTick - RANGE_CHECK_TOLERANCE_TICKS ||
+            tickUpper > twapTick + RANGE_CHECK_TOLERANCE_TICKS
+        ) {
+            revert RangeTooFarFromTwap();
+        }
+
         uint256 oldTokenId = currentPositionTokenId;
 
         if (oldTokenId != 0) {
-            _closeOldPosition(oldTokenId);
+            _closeOldPosition(oldTokenId, closeAmount0Min, closeAmount1Min, deadline);
         }
 
-        (uint256 newTokenId, uint256 amount0, uint256 amount1) = _openNewPosition(tickLower, tickUpper);
+        (uint256 newTokenId, uint256 amount0, uint256 amount1) =
+            _openNewPosition(tickLower, tickUpper, openAmount0Min, openAmount1Min, deadline);
 
         currentPositionTokenId = newTokenId;
 
@@ -475,7 +665,13 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      principal) mixed together — subtracting the returned principal
     ///      amounts isolates the real fee portion cleanly, using data we
     ///      already have for free, no extra external call required.
-    function _closeOldPosition(uint256 oldTokenId) private {
+    ///
+    ///      amount0Min/amount1Min/deadline (security audit finding #2 fix):
+    ///      passed through from the caller rather than hardcoded to 0/
+    ///      block.timestamp — rebalance() gets these from the keeper bot's
+    ///      own off-chain calculation; withdraw()/withdrawMixed() compute a
+    ///      modest on-chain minimum themselves (see their call sites).
+    function _closeOldPosition(uint256 oldTokenId, uint256 amount0Min, uint256 amount1Min, uint256 deadline) private {
         (, , , , , , , uint128 liquidity, , , , ) = positionManager.positions(oldTokenId);
 
         uint256 principal0;
@@ -486,9 +682,9 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
                 INonfungiblePositionManager.DecreaseLiquidityParams({
                     tokenId: oldTokenId,
                     liquidity: liquidity,
-                    amount0Min: 0,
-                    amount1Min: 0,
-                    deadline: block.timestamp
+                    amount0Min: amount0Min,
+                    amount1Min: amount1Min,
+                    deadline: deadline
                 })
             );
         }
@@ -546,7 +742,12 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
 
     /// @dev Also split out for the same stack-depth reason — mints a fresh
     ///      position from whatever the vault currently holds.
-    function _openNewPosition(int24 tickLower, int24 tickUpper)
+    ///      amount0Min/amount1Min/deadline (security audit finding #2 fix):
+    ///      previously hardcoded to 0/0/block.timestamp, letting anyone
+    ///      watching the mempool sandwich this mint() at a manipulated
+    ///      price. Now passed through from the caller — see rebalance()'s
+    ///      own docstring for where these come from.
+    function _openNewPosition(int24 tickLower, int24 tickUpper, uint256 amount0Min, uint256 amount1Min, uint256 deadline)
         private
         returns (uint256 newTokenId, uint256 amount0, uint256 amount1)
     {
@@ -567,10 +768,10 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
                 tickUpper: tickUpper,
                 amount0Desired: balance0,
                 amount1Desired: balance1,
-                amount0Min: 0,
-                amount1Min: 0,
+                amount0Min: amount0Min,
+                amount1Min: amount1Min,
                 recipient: address(this),
-                deadline: block.timestamp
+                deadline: deadline
             })
         );
 
@@ -584,12 +785,12 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     /// @dev Sums three things: idle USDC sitting on the contract, idle WETH
     ///      (converted via the pool's current price), and the open Uniswap
     ///      V3 position's principal + uncollected fees (also converted).
-    ///      Uses the pool's spot price (slot0), not a TWAP — spot price is
-    ///      manipulable within a single transaction/block on a low-liquidity
-    ///      pool. This pool has $75M+ TVL (checked before choosing it), which
-    ///      makes a same-block manipulation attack expensive, but it's a
-    ///      known limitation worth revisiting if that liquidity ever drops
-    ///      materially, or before scaling deposit sizes up significantly.
+    ///      Uses a 20-minute TWAP (security audit finding #1 fix — this used
+    ///      to read pool.slot0(), the spot price, which is manipulable
+    ///      within a single transaction/block via flash loan or large swap,
+    ///      including a donation-style attack against share pricing on
+    ///      deposit/withdraw). A 20-minute window requires sustained price
+    ///      pressure over real time to move, not a single transaction.
     function totalAssets() public view override returns (uint256) {
         uint256 idleUsdc = IERC20(asset()).balanceOf(address(this));
         uint256 idleWeth = pairToken.balanceOf(address(this));
@@ -669,14 +870,19 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     }
 
     /// @dev Also split out for the same stack-depth reason — isolates the
-    ///      slot0() read and the tick->sqrtPrice conversions from everything
+    ///      TWAP read and the tick->sqrtPrice conversions from everything
     ///      else in _positionValue().
+    ///      Security audit finding #1 fix: previously read pool.slot0()
+    ///      (spot price), manipulable within a single block/transaction.
+    ///      Now uses the 20-minute TWAP (TOTAL_ASSETS_TWAP_WINDOW) instead —
+    ///      moving THIS price meaningfully requires sustained pressure over
+    ///      real time, not a single flash-loan-funded transaction.
     function _liquidityValue(int24 tickLower, int24 tickUpper, uint128 liquidity)
         private
         view
         returns (uint256 amount0, uint256 amount1)
     {
-        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        uint160 sqrtPriceX96 = _getTwapSqrtPriceX96(TOTAL_ASSETS_TWAP_WINDOW);
         return _getAmountsForLiquidity(
             sqrtPriceX96,
             TickMath.getSqrtPriceAtTick(tickLower),
@@ -691,10 +897,52 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
             : (address(pairToken), address(asset()));
     }
 
-    /// @dev Converts a raw WETH amount into its USDC-equivalent at the
-    ///      pool's current spot price.
+    /// @dev Time-weighted-average tick over the given window, read from the
+    ///      pool's own observation buffer. Formula matches Uniswap's own
+    ///      OracleLibrary.consult() exactly (verified against
+    ///      v3-periphery/contracts/libraries/OracleLibrary.sol before
+    ///      writing this) — several other protocols have shipped audit
+    ///      findings specifically from getting the negative-delta rounding
+    ///      direction wrong here, so this isn't reinvented casually.
+    ///      Reverts if the pool's observation buffer doesn't hold data this
+    ///      far back (e.g. a freshly deployed pool) — failing loudly beats
+    ///      silently falling back to spot price, which would quietly reopen
+    ///      the exact manipulation this exists to close.
+    function _getTwapTick(uint32 secondsAgo) private view returns (int24) {
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = secondsAgo;
+        secondsAgos[1] = 0;
+
+        (int56[] memory tickCumulatives, ) = pool.observe(secondsAgos);
+
+        int56 tickCumulativesDelta = tickCumulatives[1] - tickCumulatives[0];
+        int24 avgTick = int24(tickCumulativesDelta / int56(uint56(secondsAgo)));
+
+        // Always round to negative infinity, matching Uniswap's own
+        // OracleLibrary — Solidity's integer division rounds toward zero,
+        // which is the wrong direction for a negative delta.
+        if (tickCumulativesDelta < 0 && (tickCumulativesDelta % int56(uint56(secondsAgo)) != 0)) {
+            avgTick--;
+        }
+
+        return avgTick;
+    }
+
+    /// @dev TWAP tick converted to a sqrtPriceX96, for direct use anywhere
+    ///      the code previously read pool.slot0()'s spot price for
+    ///      VALUATION purposes. NOT used for the keeper's own range-setting
+    ///      decision — that intentionally stays on live slot0() in the
+    ///      off-chain bot (security audit finding #1's fix applies to
+    ///      totalAssets()'s share pricing, not to rebalance()'s execution,
+    ///      which amount0Min/amount1Min protect instead — see rebalance()).
+    function _getTwapSqrtPriceX96(uint32 secondsAgo) private view returns (uint160) {
+        return TickMath.getSqrtPriceAtTick(_getTwapTick(secondsAgo));
+    }
+
+    /// @dev Converts a raw WETH amount into its USDC-equivalent using the
+    ///      20-minute TWAP (security audit finding #1 fix — was spot price).
     function _wethToUsdc(uint256 wethAmount) private view returns (uint256) {
-        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0();
+        uint160 sqrtPriceX96 = _getTwapSqrtPriceX96(TOTAL_ASSETS_TWAP_WINDOW);
 
         // priceX96 = (token1raw / token0raw) * 2^96, using raw token units —
         // this is the standard Uniswap V3 spot-price formula.
@@ -708,6 +956,20 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         } else {
             // WETH is token0, USDC is token1 -> priceX96 = token1(USDC)/token0(WETH) directly
             return FullMath.mulDiv(wethAmount, priceX96, Q96);
+        }
+    }
+
+    /// @dev Reverse of _wethToUsdc() — needed by withdrawMixed() to know how
+    ///      much WETH covers a given USDC shortfall. Same TWAP source, same
+    ///      manipulation-resistance rationale.
+    function _usdcToWeth(uint256 usdcAmount) private view returns (uint256) {
+        uint160 sqrtPriceX96 = _getTwapSqrtPriceX96(TOTAL_ASSETS_TWAP_WINDOW);
+        uint256 priceX96 = FullMath.mulDiv(uint256(sqrtPriceX96), uint256(sqrtPriceX96), Q96);
+
+        if (assetIsToken0) {
+            return FullMath.mulDiv(usdcAmount, priceX96, Q96);
+        } else {
+            return FullMath.mulDiv(usdcAmount, Q96, priceX96);
         }
     }
 
