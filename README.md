@@ -38,8 +38,7 @@ Tracks each investor's share and holds a single concentrated position via Uniswa
 ←
 03
 Keeper Bot
-Node.js · Cron · PostgreSQL
-rebalance(). The database stores only analytics — no keys, no funds.
+Node.js · Cron 
 
 ```
 
