@@ -161,6 +161,21 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///         a signature can never be replayed to authorize a second deposit.
     mapping(address => uint256) public nonces;
 
+    /// @notice "Cost basis" per address, in asset (USDC) terms — used to
+    ///         compute each depositor's personal profit on the site without
+    ///         ever scanning event history (expensive in RPC calls, was the
+    ///         original design; this replaces it entirely).
+    ///         personalProfit(user) = convertToAssets(balanceOf(user)) - costBasis[user]
+    ///         Increased by the exact deposited amount on depositWithAmlCheck().
+    ///         Decreased PROPORTIONALLY (not by the flat withdrawn amount —
+    ///         that would misattribute principal vs. already-realized profit,
+    ///         see _adjustCostBasisForWithdrawal()'s docstring) on withdraw()/
+    ///         withdrawMixed(), and moved proportionally alongside CRK shares
+    ///         on any plain transfer()/transferFrom() — otherwise a direct
+    ///         share transfer would leave the recipient's shown profit
+    ///         permanently wrong, since they never went through deposit().
+    mapping(address => uint256) public costBasis;
+
     /// @notice Wallet that will receive Crypto Range Keeper's service commission.
     ///         Foundation only for now — no fee is actually taken anywhere yet.
     address public feeRecipient;
@@ -414,6 +429,8 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         shares = deposit(assets, receiver);
         _amlGatePassed = false;
 
+        costBasis[receiver] += assets;
+
         emit AmlDeposit(msg.sender, receiver, assets, shares);
     }
 
@@ -437,6 +454,21 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      full standard conformance here.
     function mint(uint256, address) public pure override returns (uint256) {
         revert DirectDepositNotAllowed();
+    }
+
+    /// @dev Переопределены только ради costBasis-бухгалтерии (см. её
+    ///      докстринг выше) — сама логика перевода не меняется, полностью
+    ///      делегируется в super.transfer()/transferFrom(), как и раньше.
+    ///      Считаем ДО самого перевода, пока balanceOf(from) ещё отражает
+    ///      баланс до операции.
+    function transfer(address to, uint256 value) public override(ERC20, IERC20) returns (bool) {
+        _adjustCostBasisForTransfer(msg.sender, to, value);
+        return super.transfer(to, value);
+    }
+
+    function transferFrom(address from, address to, uint256 value) public override(ERC20, IERC20) returns (bool) {
+        _adjustCostBasisForTransfer(from, to, value);
+        return super.transferFrom(from, to, value);
     }
 
     // withdraw() / redeem() are intentionally left ungated (unlike deposit) —
@@ -467,6 +499,37 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      already nonReentrant, and both possible recipients here are
     ///      plain USDC/WETH — neither has a transfer callback a reentrant
     ///      call could hook into. Documented rather than force-reordered.
+    /// @dev Пропорционально уменьшает costBasis[owner_] при выводе — НЕ на
+    ///      прямую сумму вывода (assets), это была бы ошибка: если вывели,
+    ///      скажем, половину текущей стоимости позиции, то и "стоимость
+    ///      вложения" должна уменьшиться на половину, не на сумму вывода в
+    ///      долларах — иначе доход на оставшуюся долю окажется завышен
+    ///      (прямое вычитание неявно считает весь вывод "чистым возвратом
+    ///      тела", хотя по факту это пропорциональная смесь тела и уже
+    ///      реализованного дохода).
+    ///      Единственная точка входа — читает balanceOf(owner_) ДО того, как
+    ///      где-либо ниже по стеку вызовется _burn() — вызывается первой
+    ///      строкой и в _withdraw(), и в withdrawMixed(), до самого burn.
+    function _adjustCostBasisForWithdrawal(address owner_, uint256 shares) private {
+        uint256 balanceBefore = balanceOf(owner_);
+        if (balanceBefore == 0) return;
+        uint256 reduction = (costBasis[owner_] * shares) / balanceBefore;
+        costBasis[owner_] -= reduction;
+    }
+
+    /// @dev Та же пропорциональная логика, но для обычного transfer()/
+    ///      transferFrom() между кошельками — без неё costBasis остался бы
+    ///      висеть на исходном адресе, и personalProfit() у получателя
+    ///      долей был бы неверным (доли есть, а вклад в счётчике не
+    ///      записан), хотя сам он никогда не депонировал напрямую.
+    function _adjustCostBasisForTransfer(address from, address to, uint256 value) private {
+        uint256 balanceBefore = balanceOf(from);
+        if (balanceBefore == 0) return;
+        uint256 transferredBasis = (costBasis[from] * value) / balanceBefore;
+        costBasis[from] -= transferredBasis;
+        costBasis[to] += transferredBasis;
+    }
+
     function _withdraw(
         address caller,
         address receiver,
@@ -474,6 +537,8 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         uint256 assets,
         uint256 shares
     ) internal override nonReentrant {
+        _adjustCostBasisForWithdrawal(owner_, shares);
+
         uint256 idleBalance = IERC20(asset()).balanceOf(address(this));
         if (idleBalance < assets && currentPositionTokenId != 0) {
             _closeCurrentPositionWithOnChainSlippageProtection();
@@ -597,6 +662,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
             _spendAllowance(owner_, msg.sender, shares);
         }
 
+        _adjustCostBasisForWithdrawal(owner_, shares);
         _burn(owner_, shares);
 
         if (idleUsdc >= assets) {
@@ -908,6 +974,17 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///         meant to be shown on the site as "fees earned" for depositors.
     function totalYieldEarnedUsdValue() external view returns (uint256) {
         return totalYieldEarnedUsdc + (totalYieldEarnedWeth == 0 ? 0 : _wethToUsdc(totalYieldEarnedWeth));
+    }
+
+    /// @notice Персональный доход конкретного пользователя — текущая
+    ///         стоимость его долей минус его costBasis (пропорционально
+    ///         скорректированная стоимость вложения — см. докстринг у
+    ///         costBasis). Может быть отрицательным (int256, не uint256) —
+    ///         например, если позиция ещё не отбила газ или временно
+    ///         просела в цене.
+    function personalProfit(address user) external view returns (int256) {
+        uint256 currentValue = convertToAssets(balanceOf(user));
+        return int256(currentValue) - int256(costBasis[user]);
     }
 
     /// @dev Split out of totalAssets() specifically to avoid a "stack too
