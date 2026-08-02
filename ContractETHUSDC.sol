@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.34; // security audit findings L002 (floating pragma) + L008 (outdated
+                         // floor version) — was "^0.8.24", accepting any 0.8.x up to but not
+                         // including 0.9.0. Pinned to the exact version we've actually been
+                         // compiling and testing with throughout (Remix 0.8.34), so the
+                         // contract can never silently compile with a DIFFERENT compiler
+                         // version than the one it was verified against.
 
 // OpenZeppelin — pinned to a specific version so the contract compiles the
 // same way every time, regardless of whatever OpenZeppelin ships after today.
 import "@openzeppelin/contracts@5.6.1/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts@5.6.1/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts@5.6.1/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts@5.6.1/access/Ownable.sol";
+import "@openzeppelin/contracts@5.6.1/access/Ownable2Step.sol";
 import "@openzeppelin/contracts@5.6.1/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts@5.6.1/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts@5.6.1/utils/cryptography/MessageHashUtils.sol";
@@ -145,9 +150,51 @@ interface IUniswapV3PoolMinimal {
 ///      of raw USDC — this was caught and fixed before any real deposits
 ///      happened against a rebalancing version of this contract.
 ///
-///      NOT AUDITED. Deploy to testnet (Arbitrum Sepolia) first. Do not put
-///      real user funds behind this without a professional security review.
-contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
+///      Reviewed across multiple rounds of independent security audits
+///      (see /audit on the site for the published report) — findings from
+///      each round are addressed inline near the code they affect, tagged
+///      "security audit finding" so the reasoning stays attached to the
+///      code rather than living only in an external document.
+///
+///      DELIBERATE POLICY ON GAS OPTIMIZATION: this contract runs on
+///      Arbitrum, where a full rebalance() costs on the order of $0.02-0.05
+///      even fully unoptimized (observed directly, not estimated). A later
+///      audit pass flagged ~20 categories of micro gas optimizations
+///      (caching storage reads in memory, cheaper comparison operators,
+///      struct-packing, and similar) — quantified before deciding: even a
+///      generous combined estimate saves under $5/year at hourly rebalance
+///      frequency. That's not worth the real cost of touching dozens of
+///      places in an already-reviewed contract purely for gas — every such
+///      edit is a fresh chance to introduce a bug the prior audit rounds
+///      never had to consider. Deliberately skipped, not overlooked. Would
+///      revisit this calculus on an L1 deployment or at a transaction
+///      volume where the numbers actually changed the answer.
+///
+///      DEPLOYMENT SCOPE: this contract is intended for Arbitrum One only
+///      — the whole gas-cost calculus above (sub-cent rebalances, immediate
+///      close+reopen on every withdrawal, hourly keeper cycles) assumes
+///      Arbitrum's very low gas prices specifically. None of that holds on
+///      an L1 deployment (Ethereum mainnet), where the same operations
+///      would cost orders of magnitude more — a straight redeploy without
+///      revisiting these assumptions would be a mistake, not a port.
+///      Likewise scoped to Uniswap V3 pools among the top ~10 pairs by
+///      liquidity — the TWAP-manipulation resistance (see totalAssets()
+///      below) and the slippage-tolerance defaults throughout this
+///      contract were reasoned about and tested against a deep, liquid
+///      pool (the real ETH/USDC 0.05% pool has $75M+ TVL); a shallow or
+///      thinly-traded pair would need those assumptions re-examined, not
+///      just a different pool address plugged in.
+///
+///      OPERATIONAL SECURITY: the four privileged addresses this contract
+///      trusts (amlSigner, feeRecipient, keeper, owner) are held and
+///      monitored by Crypto Range Keeper (cryptorangekeeper.com) — this
+///      contract's own logic enforces role separation on-chain (no two of
+///      the four may ever be the same address — see the constructor and
+///      every setter below), but the actual custody and operational
+///      security of each key (where it's stored, who can sign with it, key
+///      rotation practices) is off-chain and outside what this contract or
+///      its code comments can attest to.
+contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
     using ECDSA for bytes32;
     using SafeERC20 for IERC20;
 
@@ -175,6 +222,57 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///         share transfer would leave the recipient's shown profit
     ///         permanently wrong, since they never went through deposit().
     mapping(address => uint256) public costBasis;
+
+    /// @notice Per-address withdrawal cooldown — prevents a griefing pattern
+    ///         where a depositor with a trivial amount (e.g. $10 in a $1M
+    ///         vault) repeatedly triggers withdraw()/withdrawMixed() in a
+    ///         tight loop (e.g. every minute) to force repeated position
+    ///         close+reopen cycles. Each cycle now reopens immediately (no
+    ///         more idle-time griefing — see _reopenPositionAfterWithdrawal()),
+    ///         but STILL incurs real slippage against the ENTIRE vault's
+    ///         liquidity each time, bounded by WITHDRAWAL_SLIPPAGE_TOLERANCE_BPS
+    ///         but nonzero — a cost paid by every depositor's share of
+    ///         totalAssets(), not just the griefer's own tiny withdrawal.
+    ///         Attack cost to the griefer is just their own gas; harm is
+    ///         socialized across the whole pool. One withdrawal per address
+    ///         per cooldown period closes this off — applies uniformly to
+    ///         BOTH withdraw()/redeem() (via _withdraw()) and
+    ///         withdrawMixed(), keyed on the SHARE OWNER (not msg.sender, so
+    ///         an allowance-based caller can't bypass it by rotating
+    ///         callers), sharing one timestamp so alternating between the
+    ///         two functions doesn't bypass it either.
+    mapping(address => uint256) public lastWithdrawalAt;
+
+    /// @notice Hard ceiling on withdrawalCooldown below — even the owner
+    ///         can never set the real cooldown ABOVE 1 hour, only at or
+    ///         below it. Caps how much a compromised or careless owner key
+    ///         could inconvenience legitimate withdrawals by raising the
+    ///         wait time; owner can still shorten it freely (e.g. to 30
+    ///         minutes) if the griefing risk is judged low enough not to
+    ///         need the full hour, but can never lengthen it past this.
+    uint256 public constant MAX_WITHDRAWAL_COOLDOWN = 1 hours;
+
+    /// @notice The actual enforced cooldown — starts at the maximum
+    ///         (MAX_WITHDRAWAL_COOLDOWN) and is owner-adjustable downward
+    ///         only via setWithdrawalCooldown() below.
+    uint256 public withdrawalCooldown = 1 hours;
+
+    /// @notice Minimum deposit amount, in asset() (USDC) raw units. Owner-
+    ///         adjustable, no upper cap (deliberate — owner is trusted,
+    ///         matches how performanceFeeBps/keeper/amlSigner are all
+    ///         already owner-controlled without needing a second key to
+    ///         co-sign every parameter change).
+    ///         Raises the cost of a Sybil-style griefing pattern: spread a
+    ///         withdrawal-cooldown bypass across many wallets, each holding
+    ///         just enough to withdraw once an hour with a real deposit
+    ///         behind it. A higher minimum means more capital has to be
+    ///         genuinely locked up per additional wallet in the attack —
+    ///         see lastWithdrawalAt's docstring for the full scenario this
+    ///         complements. Starts low (deliberately, at the project's
+    ///         current small scale) and is meant to be raised by the owner
+    ///         as real TVL grows and the attack economics start to matter
+    ///         more.
+    uint256 public minDeposit = 1e6; // $1, at USDC's 6 decimals
 
     /// @notice Персональный доход от предоставления ликвидности (торговые
     ///         комиссии), НЕЗАВИСИМЫЙ от движения цены ETH — в отличие от
@@ -294,7 +392,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     /// @notice Sanity ceiling on performanceFeeBps — even the owner can't set
     ///         it above this, so a compromised or careless owner key can't
     ///         redirect most/all of the yield.
-    uint256 public constant MAX_PERFORMANCE_FEE_BPS = 3000; // 30%
+    uint256 public constant MAX_PERFORMANCE_FEE_BPS = 2000; // 20%
 
     // ---- TWAP (security audit findings #1 and #3) ----
     // Two SEPARATE windows for two different jobs — using one window for
@@ -325,6 +423,8 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
     event KeeperUpdated(address indexed oldKeeper, address indexed newKeeper);
     event PerformanceFeeUpdated(uint256 oldBps, uint256 newBps);
+    event MinDepositUpdated(uint256 oldMinDeposit, uint256 newMinDeposit);
+    event WithdrawalCooldownUpdated(uint256 oldCooldown, uint256 newCooldown);
     event PerformanceFeeCollected(uint256 feeToken0, uint256 feeToken1);
     event AmlDeposit(address indexed caller, address indexed receiver, uint256 assets, uint256 shares);
     event Rebalanced(
@@ -346,6 +446,12 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     error RangeTooFarFromTwap();
     error InsufficientPoolValue();
     error InsufficientIdleAssetsForWithdrawal();
+    error WithdrawalCooldownActive(uint256 availableAt);
+    error DepositBelowMinimum(uint256 minimum);
+    error WithdrawalCooldownTooHigh();
+    error RenounceOwnershipDisabled();
+    error LiquidityOverflow();
+    error TickOverflow();
 
     modifier onlyKeeper() {
         if (msg.sender != keeper) revert NotKeeper();
@@ -370,7 +476,13 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         ERC20("Crypto Range Keeper Vault", "CRK")
         Ownable(initialOwner_)
     {
+        // Security audit finding L006: asset_ (USDC) was missing from this
+        // list — ERC4626's own constructor doesn't reliably catch a zero
+        // address here either (its _tryGetAssetDecimals() uses a low-level
+        // staticcall that just returns success=false on a no-code address,
+        // silently defaulting to 18 decimals rather than reverting).
         if (
+            address(asset_) == address(0) ||
             amlSigner_ == address(0) ||
             feeRecipient_ == address(0) ||
             keeper_ == address(0) ||
@@ -427,6 +539,28 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         performanceFeeBps = newBps;
     }
 
+    /// @notice Update the minimum deposit amount (see minDeposit's own
+    ///         docstring for why this exists). Deliberately uncapped —
+    ///         owner is already trusted with performanceFeeBps, keeper, and
+    ///         amlSigner without a second key required, this is no
+    ///         different in kind.
+    function setMinDeposit(uint256 newMinDeposit) external onlyOwner {
+        emit MinDepositUpdated(minDeposit, newMinDeposit);
+        minDeposit = newMinDeposit;
+    }
+
+    /// @notice Shorten the withdrawal cooldown (see lastWithdrawalAt's own
+    ///         docstring for why it exists) — e.g. down to 30 minutes, if
+    ///         the griefing risk at the current TVL is judged low enough
+    ///         not to need the full hour. Can only ever be set AT OR BELOW
+    ///         MAX_WITHDRAWAL_COOLDOWN (1 hour) — never above it, even by
+    ///         the owner; see that constant's own docstring for why.
+    function setWithdrawalCooldown(uint256 newCooldown) external onlyOwner {
+        if (newCooldown > MAX_WITHDRAWAL_COOLDOWN) revert WithdrawalCooldownTooHigh();
+        emit WithdrawalCooldownUpdated(withdrawalCooldown, newCooldown);
+        withdrawalCooldown = newCooldown;
+    }
+
     /// @notice Update the keeper bot's wallet (e.g. rotating to a new server).
     function setKeeper(address newKeeper) external onlyOwner {
         if (newKeeper == address(0)) revert ZeroAddress();
@@ -437,9 +571,28 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
 
     /// @dev Same fat-finger protection as the constructor and the other
     ///      setters — the new owner can't already hold another role.
+    ///      Security audit finding L009: now two-step (Ownable2Step) —
+    ///      this call only proposes `newOwner`; they must separately call
+    ///      acceptOwnership() themselves to actually take over. Protects
+    ///      against transferring ownership to a mistyped or unreachable
+    ///      address, which under plain Ownable would be immediate and
+    ///      irreversible — for a contract with no way to recover a lost
+    ///      owner role (no admin backdoor, by design), that mistake would
+    ///      be permanent.
     function transferOwnership(address newOwner) public override onlyOwner {
         if (newOwner == amlSigner || newOwner == feeRecipient || newOwner == keeper) revert DuplicateRoleAddress();
         super.transferOwnership(newOwner);
+    }
+
+    /// @notice Disabled — this vault always needs an active owner to manage
+    ///         amlSigner/keeper/feeRecipient roles; renouncing would
+    ///         permanently orphan those functions with no recovery path
+    ///         (no admin backdoor exists, by design). Related to security
+    ///         audit finding L009 — Ownable2Step protects transferOwnership()
+    ///         from typos, but doesn't guard renounceOwnership() the same
+    ///         way, so it's blocked outright instead.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceOwnershipDisabled();
     }
 
     /// @notice The only allowed entry point for deposits. Requires a fresh
@@ -452,6 +605,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         uint256 deadline,
         bytes calldata signature
     ) external returns (uint256 shares) {
+        if (assets < minDeposit) revert DepositBelowMinimum(minDeposit);
         if (block.timestamp > deadline) revert AmlSignatureExpired();
 
         uint256 nonce = nonces[receiver];
@@ -551,6 +705,21 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     ///      already nonReentrant, and both possible recipients here are
     ///      plain USDC/WETH — neither has a transfer callback a reentrant
     ///      call could hook into. Documented rather than force-reordered.
+    /// @dev Security audit finding: griefing via repeated tiny withdrawals
+    ///      in a tight loop, forcing repeated position close+reopen cycles
+    ///      that each incur real slippage against the WHOLE vault's
+    ///      liquidity, not just the griefer's own tiny amount — see
+    ///      lastWithdrawalAt's own docstring for the full attack scenario.
+    ///      Called first thing in both _withdraw() and withdrawMixed(),
+    ///      keyed on the share owner so it can't be bypassed by rotating
+    ///      which address calls in (allowance-based withdrawals still key
+    ///      on whose shares are actually being drawn down).
+    function _enforceWithdrawalCooldown(address owner_) private {
+        uint256 availableAt = lastWithdrawalAt[owner_] + withdrawalCooldown;
+        if (block.timestamp < availableAt) revert WithdrawalCooldownActive(availableAt);
+        lastWithdrawalAt[owner_] = block.timestamp;
+    }
+
     /// @dev Пропорционально уменьшает costBasis[owner_] при выводе — НЕ на
     ///      прямую сумму вывода (assets), это была бы ошибка: если вывели,
     ///      скажем, половину текущей стоимости позиции, то и "стоимость
@@ -565,6 +734,13 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     function _adjustCostBasisForWithdrawal(address owner_, uint256 shares) private {
         uint256 balanceBefore = balanceOf(owner_);
         if (balanceBefore == 0) return;
+        // Security audit finding M001: целочисленное деление здесь
+        // (умножение уже стоит ПЕРЕД делением — верный порядок, защищает
+        // от худшей версии этой проблемы) теряет не более 1 raw-единицы
+        // за вызов — максимум $0.000001 при costBasis вплоть до
+        // $1,000,000. Сознательно не стали добавлять масштабирующий
+        // множитель (как YIELD_PRECISION у accYieldPerShare рядом) —
+        // эффект на практике неотличим от нуля, не стоит лишней сложности.
         uint256 reduction = (costBasis[owner_] * shares) / balanceBefore;
         costBasis[owner_] -= reduction;
     }
@@ -577,6 +753,9 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     function _adjustCostBasisForTransfer(address from, address to, uint256 value) private {
         uint256 balanceBefore = balanceOf(from);
         if (balanceBefore == 0) return;
+        // Security audit finding M001 — тот же случай, что в
+        // _adjustCostBasisForWithdrawal() выше: максимум $0.000001 потери
+        // на вызов, сознательно не масштабируем, см. комментарий там.
         uint256 transferredBasis = (costBasis[from] * value) / balanceBefore;
         costBasis[from] -= transferredBasis;
         costBasis[to] += transferredBasis;
@@ -641,6 +820,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         uint256 assets,
         uint256 shares
     ) internal override nonReentrant {
+        _enforceWithdrawalCooldown(owner_);
         _adjustCostBasisForWithdrawal(owner_, shares);
         _settleYieldBefore(owner_);
 
@@ -868,6 +1048,8 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         nonReentrant
         returns (uint256 shares)
     {
+        _enforceWithdrawalCooldown(owner_);
+
         uint256 maxAssets = maxWithdraw(owner_);
         if (assets > maxAssets) {
             revert ERC4626ExceededMaxWithdraw(owner_, assets, maxAssets);
@@ -901,7 +1083,11 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         _resetYieldDebtAfter(owner_);
 
         if (idleUsdc >= assets) {
-            IERC20(asset()).safeTransfer(receiver, assets);
+            // Security audit finding L004: guard against a zero-value
+            // transfer (harmless no-op for USDC/WETH, but a wasted external
+            // call/gas if `assets` happens to be 0 — same pattern already
+            // used for the idleUsdc branch just below).
+            if (assets > 0) IERC20(asset()).safeTransfer(receiver, assets);
         } else {
             uint256 usdcShortfall = assets - idleUsdc;
             uint256 wethNeeded = _usdcToWeth(usdcShortfall);
@@ -912,7 +1098,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
             if (wethNeeded > wethAvailable) revert InsufficientPoolValue();
 
             if (idleUsdc > 0) IERC20(asset()).safeTransfer(receiver, idleUsdc);
-            pairToken.safeTransfer(receiver, wethNeeded);
+            if (wethNeeded > 0) pairToken.safeTransfer(receiver, wethNeeded);
         }
 
         if (closedPosition) {
@@ -957,7 +1143,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         uint256 openAmount0Min,
         uint256 openAmount1Min,
         uint256 deadline
-    ) external onlyKeeper nonReentrant {
+    ) external nonReentrant onlyKeeper {
         int24 twapTick = _getTwapTick(RANGE_CHECK_TWAP_WINDOW);
         if (
             tickLower < twapTick - RANGE_CHECK_TOLERANCE_TICKS ||
@@ -1213,6 +1399,30 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         // forceApprove и так гарантирует на следующий вызов.
     }
 
+    /// @dev Security audit finding M002 (independent, second review):
+    ///      OpenZeppelin's ERC4626 has built-in "virtual shares" protection
+    ///      against the classic inflation/donation attack (an attacker
+    ///      mints a tiny amount of shares, then donates a large raw token
+    ///      amount directly to the vault's balance — bypassing any price
+    ///      logic entirely, since balanceOf() just reads real token balance
+    ///      — to skew the exchange rate against the next depositor). That
+    ///      protection is controlled by _decimalsOffset(), defaulting to 0
+    ///      (minimal but non-zero protection) unless overridden. Left at
+    ///      the default since the project's very first security review —
+    ///      that review's TWAP fix (see totalAssets() below) protects
+    ///      against PRICE manipulation of the WETH portion specifically,
+    ///      but a raw donation attack against idle USDC/WETH balances is a
+    ///      genuinely separate vector TWAP doesn't touch at all. A non-zero
+    ///      offset makes the attack exponentially more expensive without
+    ///      changing any user-visible behavior — shares (CRK) are
+    ///      deliberately never displayed on the site at all, only their
+    ///      USD-equivalent value via convertToAssets() (which stays in
+    ///      asset() decimals — USDC's 6 — regardless of this offset), so
+    ///      there's no display assumption anywhere to break.
+    function _decimalsOffset() internal pure override returns (uint8) {
+        return 6;
+    }
+
     /// @notice Total vault value, expressed in `asset()` (USDC) — the number
     ///         ERC4626 uses to price shares on every deposit/withdraw.
     /// @dev Sums three things: idle USDC sitting on the contract, idle WETH
@@ -1393,7 +1603,33 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         (int56[] memory tickCumulatives, ) = pool.observe(secondsAgos);
 
         int56 tickCumulativesDelta = tickCumulatives[1] - tickCumulatives[0];
-        int24 avgTick = int24(tickCumulativesDelta / int56(uint56(secondsAgo)));
+        int256 avgTickWide = tickCumulativesDelta / int56(uint56(secondsAgo));
+
+        // Security audit finding L001 (same class as the liquidity casts
+        // below) — real pool ticks are always within Uniswap's own
+        // MIN_TICK/MAX_TICK bounds (±887272, well inside int24's range),
+        // and a TWAP is just an average of real ticks, so this should
+        // never actually trigger — explicit check costs nothing and closes
+        // the theoretical gap rather than silently wrapping.
+        //
+        // NOTE on the bound used here: this checks against int24's own
+        // TYPE range (±8,388,608), not Uniswap's tighter protocol MIN_TICK/
+        // MAX_TICK (±887,272) — deliberately. The gap between them means
+        // this wouldn't catch a nonsensical-but-in-range value, but that
+        // gap is only reachable from a pool lying about its own tick data
+        // in the first place (this contract is scoped to genuine, canonical
+        // Uniswap V3 pools among top-liquidity pairs — see the contract's
+        // own top-level docstring), which is a different, broader threat
+        // model a tick bounds check wouldn't meaningfully address anyway.
+        // Also worth noting: the avgTick-- decrement a few lines below is
+        // safe even at Uniswap's real MIN_TICK (-887272 - 1 is nowhere near
+        // int24's actual underflow boundary) — the type-level check above
+        // is about closing a theoretical casting gap, unrelated to that
+        // decrement's own safety.
+        if (avgTickWide > int256(int24(type(int24).max)) || avgTickWide < int256(int24(type(int24).min))) {
+            revert TickOverflow();
+        }
+        int24 avgTick = int24(avgTickWide);
 
         // Always round to negative infinity, matching Uniswap's own
         // OracleLibrary — Solidity's integer division rounds toward zero,
@@ -1501,6 +1737,22 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     // порт, что уже сделан для бота в bot/tickMath.js — здесь нужен и
     // ончейн-вариант для _reopenPositionAfterWithdrawal(), у которой нет
     // бота с готовыми числами).
+    //
+    // Security audit finding L001: сужающее приведение uint256 -> uint128
+    // само по себе молча "заворачивается" (truncate), если результат
+    // превышает предел uint128 — Solidity не проверяет это автоматически
+    // для явных приведений типов (в отличие от арифметики, где overflow
+    // ловится сам). На практике результат сюда попадает из FullMath.mulDiv
+    // при реалистичных суммах вейлта (посчитано отдельно — переполнение
+    // потребовало бы порядка $10^24, астрономически недостижимо), но
+    // явная проверка ничего не стоит и полностью убирает даже
+    // теоретический риск — тот же приём, что использует сам Uniswap в
+    // своём toUint128().
+    function _toUint128(uint256 value) private pure returns (uint128) {
+        if (value > type(uint128).max) revert LiquidityOverflow();
+        return uint128(value);
+    }
+
     function _getLiquidityForAmount0(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint256 amount0)
         private
         pure
@@ -1508,7 +1760,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
     {
         if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
         uint256 intermediate = FullMath.mulDiv(sqrtRatioAX96, sqrtRatioBX96, FixedPoint96.Q96);
-        return uint128(FullMath.mulDiv(amount0, intermediate, sqrtRatioBX96 - sqrtRatioAX96));
+        return _toUint128(FullMath.mulDiv(amount0, intermediate, sqrtRatioBX96 - sqrtRatioAX96));
     }
 
     function _getLiquidityForAmount1(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint256 amount1)
@@ -1517,7 +1769,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable, ReentrancyGuard {
         returns (uint128 liquidity)
     {
         if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
-        return uint128(FullMath.mulDiv(amount1, FixedPoint96.Q96, sqrtRatioBX96 - sqrtRatioAX96));
+        return _toUint128(FullMath.mulDiv(amount1, FixedPoint96.Q96, sqrtRatioBX96 - sqrtRatioAX96));
     }
 
     function _getLiquidityForAmounts(
