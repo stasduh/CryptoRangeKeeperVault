@@ -194,6 +194,66 @@ interface IUniswapV3PoolMinimal {
 ///      security of each key (where it's stored, who can sign with it, key
 ///      rotation practices) is off-chain and outside what this contract or
 ///      its code comments can attest to.
+///
+///      PROJECT LINKS — for anyone reading this contract directly (e.g.
+///      arriving here via a Revert Finance position listing, Arbiscan, or
+///      any other on-chain explorer, not necessarily the site itself):
+///        Website:  https://cryptorangekeeper.com/
+///        Support:  support [at] cryptorangekeeper.com
+///        GitHub:   https://github.com/stasduh/CryptoRangeKeeperVault
+///        Discord:  https://discord.gg/smEFnSsX
+///        X/Twitter: https://x.com/cryptorangekeep
+///        Telegram: https://t.me/cryptorangekeeper
+///        Audit report: https://cryptorangekeeper.com/audit
+///
+///      ROLE SEPARATION: this contract has four distinct privileged roles,
+///      each with a narrow, specific purpose:
+///        - owner: manages parameters and roles (setMinDeposit,
+///          setWithdrawalCooldown, setPerformanceFeeBps, and appointing the
+///          other three roles below). Two-step transfer (Ownable2Step) and
+///          cannot renounce (see renounceOwnership() below).
+///        - amlSigner: signs off-chain AML approvals required for deposits
+///          (depositWithAmlCheck()) — can be rotated by the owner
+///          (setAmlSigner()).
+///        - keeper: the only address allowed to call rebalance() — can be
+///          rotated by the owner (setKeeper()).
+///        - feeRecipient: receives the service's performance fee cut —
+///          can be rotated by the owner (setFeeRecipient()).
+///      NONE of these four roles can move a depositor's funds anywhere
+///      except back to that same depositor (or their designated receiver
+///      on withdraw/redeem/withdrawMixed) — there is no function, on any
+///      role, that transfers vault assets to an arbitrary address chosen
+///      by owner/amlSigner/keeper/feeRecipient. The only address ever
+///      credited from the vault's own token balances is feeRecipient, and
+///      only with the specific, capped performanceFeeBps cut of realized
+///      trading fees — never principal, never at an arbitrary amount.
+///
+///      NO PROXY PATTERN: this is a plain, non-upgradeable contract — no
+///      delegatecall-based proxy, no initialize() function, no
+///      post-deployment setup step of any kind. Every parameter is set
+///      exactly once, inside the constructor, which by Solidity's own
+///      construction can only ever run at deployment and can never be
+///      called again afterward. There is no admin function anywhere in
+///      this contract that changes the contract's own logic/bytecode —
+///      the only way to "upgrade" this vault is a fresh deployment at a
+///      new address, which is by design (see DEPLOYMENT SCOPE above for
+///      why frequent redeployment is deliberately avoided).
+///
+///      ACCESS CONTROL: every administrative function is gated by the
+///      correct modifier for its role (onlyOwner for owner-only functions,
+///      onlyKeeper for rebalance()) — there is no administrative function
+///      left ungated, and no function checks a role other than the one it
+///      actually needs.
+///
+///      NO tx.origin: this contract never reads tx.origin anywhere, for
+///      any purpose — every authorization check (onlyOwner, onlyKeeper,
+///      AML signature recovery, allowance checks) uses msg.sender. Using
+///      tx.origin for authorization is a well-known phishing vector (a
+///      malicious contract can trick a user into a transaction that acts
+///      "as" them via tx.origin, even though msg.sender would correctly
+///      show the malicious contract as the immediate caller) — not a risk
+///      this contract has any exposure to, since the pattern isn't used at
+///      all, anywhere, not even for logging or informational purposes.
 contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
     using ECDSA for bytes32;
     using SafeERC20 for IERC20;
@@ -274,33 +334,32 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
     ///         more.
     uint256 public minDeposit = 1e6; // $1, at USDC's 6 decimals
 
-    /// @notice Персональный доход от предоставления ликвидности (торговые
-    ///         комиссии), НЕЗАВИСИМЫЙ от движения цены ETH — в отличие от
-    ///         personalProfit()/costBasis выше (которые отражают полный
-    ///         финансовый результат, включая переоценку WETH-части по
-    ///         рынку). Это ответ на другой вопрос: "сколько именно
-    ///         заработали мои деньги на комиссиях", не "насколько выросла/
-    ///         просела стоимость моей позиции".
+    /// @notice Personal income from providing liquidity (trading fees),
+    ///         INDEPENDENT of ETH price movement — unlike personalProfit()/
+    ///         costBasis above (which reflect the full financial result,
+    ///         including mark-to-market revaluation of the WETH portion).
+    ///         This answers a different question: "how much did my money
+    ///         actually earn in fees", not "how much did my position's
+    ///         value go up or down".
     ///
-    ///         Стандартный паттерн начисления наград (тот же, что в
-    ///         MasterChef/большинстве стейкинг-контрактов): один растущий
-    ///         "индекс дохода на 1 долю" на уровне всего вейлта (двигается
-    ///         только в момент реализации дохода, в _closeOldPosition()),
-    ///         и у каждого пользователя — своя "точка отсчёта" в этом
-    ///         индексе (yieldDebt), обновляемая при каждом изменении его
-    ///         баланса долей. Разница между текущим индексом и точкой
-    ///         отсчёта, умноженная на баланс — ещё не "расчётный" (pending)
-    ///         доход; personalYieldEarnedUsdc/Weth — уже окончательно
-    ///         зафиксированная часть (только растёт, вывод части денег её
-    ///         не уменьшает).
+    ///         Standard reward-accrual pattern (same as MasterChef and most
+    ///         staking contracts): one vault-wide, ever-growing "yield per
+    ///         share" index (moves only when yield is realized, in
+    ///         _closeOldPosition()), and each user has their own "checkpoint"
+    ///         in that index (yieldDebt), updated on every change to their
+    ///         share balance. The difference between the current index and
+    ///         a user's checkpoint, multiplied by their balance, is their
+    ///         not-yet-settled ("pending") yield; personalYieldEarnedUsdc/Weth
+    ///         is the already-settled portion (only ever grows — withdrawing
+    ///         part of the balance never reduces it).
     ///
-    ///         ВАЖНО (security audit finding #2, 3-й раунд): растёт на
-    ///         ЧИСТЫЙ доход, ПОСЛЕ вычета комиссии сервиса — не на ту же
-    ///         валовую сумму, что totalYieldEarnedUsdc/Weth (тот показатель
-    ///         остаётся валовым намеренно, для публичной статистики). Иначе
-    ///         personalFeesEarnedUsdValue() показывал бы пользователю
-    ///         деньги, часть которых уже физически ушла feeRecipient и не
-    ///         содержится в totalAssets() — вводя его в заблуждение.
+    ///         IMPORTANT (security audit finding #2, round 3): this grows
+    ///         on the NET yield, AFTER the service's fee cut — not the same
+    ///         gross figure as totalYieldEarnedUsdc/Weth (that figure stays
+    ///         gross deliberately, for public-facing statistics). Otherwise
+    ///         personalFeesEarnedUsdValue() would show the user money that
+    ///         has already physically left to feeRecipient and isn't in
+    ///         totalAssets() anymore — misleading them.
     uint256 private constant YIELD_PRECISION = 1e18;
 
     uint256 public accYieldPerShareUsdc;
@@ -604,7 +663,7 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         address receiver,
         uint256 deadline,
         bytes calldata signature
-    ) external returns (uint256 shares) {
+    ) external nonReentrant returns (uint256 shares) {
         if (assets < minDeposit) revert DepositBelowMinimum(minDeposit);
         if (block.timestamp > deadline) revert AmlSignatureExpired();
 
@@ -652,11 +711,11 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         revert DirectDepositNotAllowed();
     }
 
-    /// @dev Переопределены только ради costBasis-бухгалтерии (см. её
-    ///      докстринг выше) — сама логика перевода не меняется, полностью
-    ///      делегируется в super.transfer()/transferFrom(), как и раньше.
-    ///      Считаем ДО самого перевода, пока balanceOf(from) ещё отражает
-    ///      баланс до операции.
+    /// @dev Overridden purely for costBasis bookkeeping (see its own
+    ///      docstring above) — the actual transfer logic doesn't change,
+    ///      it's fully delegated to super.transfer()/transferFrom() as
+    ///      before. Computed BEFORE the transfer itself, while
+    ///      balanceOf(from) still reflects the pre-transfer balance.
     function transfer(address to, uint256 value) public override(ERC20, IERC20) returns (bool) {
         _adjustCostBasisForTransfer(msg.sender, to, value);
         _settleYieldBefore(msg.sender);
@@ -720,53 +779,58 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         lastWithdrawalAt[owner_] = block.timestamp;
     }
 
-    /// @dev Пропорционально уменьшает costBasis[owner_] при выводе — НЕ на
-    ///      прямую сумму вывода (assets), это была бы ошибка: если вывели,
-    ///      скажем, половину текущей стоимости позиции, то и "стоимость
-    ///      вложения" должна уменьшиться на половину, не на сумму вывода в
-    ///      долларах — иначе доход на оставшуюся долю окажется завышен
-    ///      (прямое вычитание неявно считает весь вывод "чистым возвратом
-    ///      тела", хотя по факту это пропорциональная смесь тела и уже
-    ///      реализованного дохода).
-    ///      Единственная точка входа — читает balanceOf(owner_) ДО того, как
-    ///      где-либо ниже по стеку вызовется _burn() — вызывается первой
-    ///      строкой и в _withdraw(), и в withdrawMixed(), до самого burn.
+    /// @dev Proportionally reduces costBasis[owner_] on withdrawal — NOT by
+    ///      the flat withdrawn amount (assets), which would be wrong: if,
+    ///      say, half the position's current value was withdrawn, the
+    ///      "cost basis" should shrink by half too, not by the dollar
+    ///      amount withdrawn — otherwise the yield shown on the remaining
+    ///      share would be overstated (flat subtraction implicitly treats
+    ///      the whole withdrawal as a "clean return of principal", when in
+    ///      reality it's a proportional mix of principal and already-
+    ///      realized profit).
+    ///      Single entry point — reads balanceOf(owner_) BEFORE _burn() is
+    ///      called anywhere further down the stack — called as the first
+    ///      line in both _withdraw() and withdrawMixed(), before the burn
+    ///      itself.
     function _adjustCostBasisForWithdrawal(address owner_, uint256 shares) private {
         uint256 balanceBefore = balanceOf(owner_);
         if (balanceBefore == 0) return;
-        // Security audit finding M001: целочисленное деление здесь
-        // (умножение уже стоит ПЕРЕД делением — верный порядок, защищает
-        // от худшей версии этой проблемы) теряет не более 1 raw-единицы
-        // за вызов — максимум $0.000001 при costBasis вплоть до
-        // $1,000,000. Сознательно не стали добавлять масштабирующий
-        // множитель (как YIELD_PRECISION у accYieldPerShare рядом) —
-        // эффект на практике неотличим от нуля, не стоит лишней сложности.
+        // Security audit finding M001: the integer division here
+        // (multiplication already happens BEFORE the division — the
+        // correct order, which avoids the worse version of this issue)
+        // loses at most 1 raw unit per call — at most $0.000001 even with
+        // costBasis up to $1,000,000. Deliberately not adding a scaling
+        // factor (like YIELD_PRECISION next to accYieldPerShare) — the
+        // effect is practically indistinguishable from zero, not worth the
+        // added complexity.
         uint256 reduction = (costBasis[owner_] * shares) / balanceBefore;
         costBasis[owner_] -= reduction;
     }
 
-    /// @dev Та же пропорциональная логика, но для обычного transfer()/
-    ///      transferFrom() между кошельками — без неё costBasis остался бы
-    ///      висеть на исходном адресе, и personalProfit() у получателя
-    ///      долей был бы неверным (доли есть, а вклад в счётчике не
-    ///      записан), хотя сам он никогда не депонировал напрямую.
+    /// @dev Same proportional logic, but for a plain transfer()/
+    ///      transferFrom() between wallets — without this, costBasis would
+    ///      stay stuck on the original address, and personalProfit() for
+    ///      the recipient of the shares would be wrong (they'd have the
+    ///      shares, but no corresponding contribution recorded in the
+    ///      counter), even though they never deposited directly.
     function _adjustCostBasisForTransfer(address from, address to, uint256 value) private {
         uint256 balanceBefore = balanceOf(from);
         if (balanceBefore == 0) return;
-        // Security audit finding M001 — тот же случай, что в
-        // _adjustCostBasisForWithdrawal() выше: максимум $0.000001 потери
-        // на вызов, сознательно не масштабируем, см. комментарий там.
+        // Security audit finding M001 — same case as
+        // _adjustCostBasisForWithdrawal() above: at most $0.000001 lost per
+        // call, deliberately left unscaled, see the comment there.
         uint256 transferredBasis = (costBasis[from] * value) / balanceBefore;
         costBasis[from] -= transferredBasis;
         costBasis[to] += transferredBasis;
     }
 
-    /// @dev Вызывать ПЕРЕД любым изменением баланса долей пользователя —
-    ///      "фиксирует" ещё не расчётный (pending) доход по его ТЕКУЩЕМУ
-    ///      (до изменения) балансу в personalYieldEarnedUsdc/Weth, которые
-    ///      только растут и не пострадают от последующего изменения
-    ///      баланса. Не трогает сам баланс долей и не делает внешних
-    ///      вызовов — только чтение/запись собственных mapping.
+    /// @dev Call BEFORE any change to a user's share balance — "settles"
+    ///      their not-yet-accounted-for (pending) yield against their
+    ///      CURRENT (pre-change) balance into personalYieldEarnedUsdc/Weth,
+    ///      which only ever grow and won't be affected by the balance
+    ///      change that follows. Doesn't touch the share balance itself and
+    ///      makes no external calls — only reads/writes this contract's own
+    ///      mappings.
     function _settleYieldBefore(address user) private {
         uint256 bal = balanceOf(user);
         if (bal == 0) return;
@@ -776,9 +840,9 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         personalYieldEarnedWeth[user] += pendingWeth;
     }
 
-    /// @dev Вызывать ПОСЛЕ любого изменения баланса долей пользователя —
-    ///      пересчитывает его "точку отсчёта" под уже НОВЫЙ баланс, чтобы
-    ///      будущий доход не задваивался/не терялся при следующем settle.
+    /// @dev Call AFTER any change to a user's share balance — recomputes
+    ///      their "checkpoint" against the already-updated NEW balance, so
+    ///      future yield isn't double-counted or lost on the next settle.
     function _resetYieldDebtAfter(address user) private {
         uint256 bal = balanceOf(user);
         _yieldDebtUsdc[user] = (bal * accYieldPerShareUsdc) / YIELD_PRECISION;
@@ -828,6 +892,17 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         int24 closedTickLower;
         int24 closedTickUpper;
 
+        // Static-analysis note (Slither): this first read is NOT the
+        // security-critical one — it only decides whether to enter the
+        // closing branch below at all. The value that actually gates the
+        // payout is re-read fresh immediately after the external close
+        // call (see the second assignment to idleBalance a few lines down,
+        // right before the real check) — that's the read that matters, and
+        // it's already always current. Even if this first read were somehow
+        // stale, the worst case is an incorrect decision on whether to
+        // close (over- or under-eager), never an incorrect payout — and
+        // this whole function is nonReentrant, so no other call can
+        // interleave and make it stale in the first place.
         uint256 idleBalance = IERC20(asset()).balanceOf(address(this));
         if (idleBalance < assets && currentPositionTokenId != 0) {
             (closedTickLower, closedTickUpper, closedPosition) = _closeCurrentPositionWithOnChainSlippageProtection();
@@ -950,14 +1025,29 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
     ///      doesn't otherwise need (rebalance() SHOULD revert on a real
     ///      mint failure — that's a keeper problem to see and fix, not
     ///      something to silently swallow).
+    /// @notice Emitted whenever _reopenPositionAfterWithdrawal() didn't end
+    ///         up minting a new position — the real reason a withdrawal's
+    ///         leftover capital sat idle instead of reopening immediately.
+    ///         Never reverts anything on its own (this is purely
+    ///         informational — see _reopenPositionAfterWithdrawal()'s own
+    ///         docstring for why a failed reopen must never block the
+    ///         withdrawal itself), but without this event there was
+    ///         previously no way to tell WHY a reopen didn't happen short
+    ///         of manually reconstructing it from raw token transfer logs.
+    event ReopenSkipped(string reason);
+
     function _reopenPositionAfterWithdrawal(int24 tickLower, int24 tickUpper) private {
         (address token0, address token1) = _sortedTokens();
         uint256 balance0 = IERC20(token0).balanceOf(address(this));
         uint256 balance1 = IERC20(token1).balanceOf(address(this));
 
-        // Ничего не осталось (или совсем пыль) — нечего открывать, оставляем
-        // как есть, keeper подберёт и включит в позицию на следующем цикле.
-        if (balance0 == 0 && balance1 == 0) return;
+        // Nothing left (or just dust) — nothing to reopen with, leave it
+        // as is, the keeper will pick it up and fold it into the position
+        // on its next cycle.
+        if (balance0 == 0 && balance1 == 0) {
+            emit ReopenSkipped("no balance left to reopen with");
+            return;
+        }
 
         (uint160 sqrtPriceX96Spot, , , , , , ) = pool.slot0();
         uint128 liquidity = _getLiquidityForAmounts(
@@ -967,7 +1057,17 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
             balance0,
             balance1
         );
-        if (liquidity == 0) return; // остаток слишком мал, чтобы вообще что-то заминтить
+        if (liquidity == 0) {
+            // Real-world case that prompted adding this event: after a
+            // withdrawal payout left the vault holding almost entirely one
+            // token (e.g. ~$19.56 in WETH against ~$0 USDC), reusing the
+            // OLD range (built for a more balanced composition) can price
+            // out to zero achievable liquidity — nothing was wrong, the
+            // leftover just didn't fit that particular range well. The
+            // keeper's next real rebalance picks a fresh range that does.
+            emit ReopenSkipped("computed liquidity is zero for this range");
+            return;
+        }
 
         (uint256 expected0, uint256 expected1) = _getAmountsForLiquidity(
             sqrtPriceX96Spot,
@@ -1002,11 +1102,15 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         ) returns (uint256 newTokenId, uint128, uint256 amount0, uint256 amount1) {
             currentPositionTokenId = newTokenId;
             emit Rebalanced(0, newTokenId, tickLower, tickUpper, amount0, amount1);
+        } catch Error(string memory reason) {
+            // Uniswap's "Price slippage check" and similar require()-based
+            // reverts land here, with the actual human-readable reason
+            // instead of a blank catch swallowing it.
+            emit ReopenSkipped(reason);
         } catch {
-            // Молча пропускаем — деньги пользователя уже надёжно выплачены
-            // ДО этой попытки (см. порядок вызовов в _withdraw()/
-            // withdrawMixed()), остаток просто ждёт следующего настоящего
-            // ребаланса, как ждал бы и без этой оптимизации вообще.
+            // Custom errors, panics (e.g. arithmetic), or any other revert
+            // shape without a plain string reason.
+            emit ReopenSkipped("mint reverted with no readable reason");
         }
     }
 
@@ -1064,8 +1168,8 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
             idleUsdc = IERC20(asset()).balanceOf(address(this));
         }
 
-        // shares вычисляется ПОСЛЕ возможного закрытия позиции (третий
-        // раунд аудита, находка #2) — closing pays a performance fee out to
+        // shares is computed AFTER any position close (security audit
+        // round 3, finding #2) — closing pays a performance fee out to
         // feeRecipient and settles previously-stale accrued yield into
         // totalAssets(), both of which change the share price. Computing
         // shares against the pre-close totalAssets() would burn a slightly
@@ -1248,9 +1352,9 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
             })
         );
 
-        // Реальное изменение баланса контракта — ground truth, не
-        // внутренний учёт Uniswap. Комиссия физически не может превысить
-        // то, что действительно пришло на баланс.
+        // The contract's own real balance change — ground truth, not
+        // Uniswap's internal accounting. The fee physically cannot exceed
+        // what actually landed on the balance.
         uint256 totalReceived0 = IERC20(token0).balanceOf(address(this)) - balance0Before;
         uint256 totalReceived1 = IERC20(token1).balanceOf(address(this)) - balance1Before;
 
@@ -1260,9 +1364,9 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         uint256 feeAmount0 = (feeAmount0Gross * performanceFeeBps) / 10000;
         uint256 feeAmount1 = (feeAmount1Gross * performanceFeeBps) / 10000;
 
-        // Валовой доход от ликвидности — 100% накопленного (до вычета
-        // комиссии сервиса). Это и есть число, которое положено показывать
-        // публично на сайте — не то, что уходит feeRecipient.
+        // Gross yield from liquidity provision — 100% of what accrued,
+        // before the service's fee cut. This is the number meant to be
+        // shown publicly on the site — not what goes to feeRecipient.
         if (feeAmount0Gross > 0 || feeAmount1Gross > 0) {
             uint256 yieldUsdcGross;
             uint256 yieldWethGross;
@@ -1283,13 +1387,13 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
             totalYieldEarnedUsdc += yieldUsdcGross;
             totalYieldEarnedWeth += yieldWethGross;
 
-            // Растущий индекс "доход на 1 долю" — security audit finding #2
-            // (3-й раунд): НЕ та же валовая сумма, что totalYieldEarnedUsdc/
-            // Weth выше — комиссия сервиса физически уходит feeRecipient и
-            // покидает вейлт, значит персональный показатель обязан считать
-            // ЧИСТЫЙ доход (после вычета), иначе personalFeesEarnedUsdValue()
-            // показывал бы пользователю деньги, которые он не может
-            // полностью извлечь — их часть уже не в totalAssets().
+            // Growing "yield per share" index — security audit finding #2
+            // (round 3): NOT the same gross figure as totalYieldEarnedUsdc/
+            // Weth above — the service's cut physically leaves for
+            // feeRecipient and leaves the vault, so the personal-facing
+            // figure must be the NET yield (after that cut), otherwise
+            // personalFeesEarnedUsdValue() would show the user money they
+            // can't fully withdraw — part of it is no longer in totalAssets().
             uint256 supply = totalSupply();
             if (supply > 0) {
                 uint256 yieldUsdcNet = yieldUsdcGross - serviceFeeUsdc;
@@ -1299,19 +1403,19 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
             }
         }
 
-        // Security audit finding: feeRecipient — единственная точка отказа
-        // на критическом пути. Раньше safeTransfer() сюда откатывал ВСЮ
-        // транзакцию при неудаче — а закрытие позиции нужно почти для
-        // любого вывода (если idle USDC не хватает), значит сломанный или
-        // злонамеренно подставленный feeRecipient (например, контракт,
-        // всегда делающий revert при получении токенов — специально, при
-        // компрометации owner, или просто по ошибке при смене адреса)
-        // парализовал бы вывод для ВСЕХ пользователей разом, до
-        // вмешательства владельца. Теперь неудачная отправка комиссии не
-        // блокирует ничего — сумма просто остаётся на балансе вейлта
-        // (не потеряна, реинвестируется вместе со всем остальным),
-        // счётчик totalFeesCollectedUsdc/Weth растёт только на реально
-        // отправленное, не на то, что "должно было" уйти.
+        // Security audit finding: feeRecipient was a single point of
+        // failure on the critical path. Previously safeTransfer() here
+        // reverted the ENTIRE transaction on failure — and closing the
+        // position is needed for almost any withdrawal (whenever idle USDC
+        // is short), so a broken or maliciously-set feeRecipient (e.g. a
+        // contract that always reverts on receiving tokens — whether
+        // deliberately, via a compromised owner key, or just by mistake
+        // when rotating the address) would paralyze withdrawals for
+        // EVERY user at once, until the owner intervened. Now a failed
+        // fee transfer blocks nothing — the amount simply stays on the
+        // vault's own balance (not lost, reinvested along with everything
+        // else), and totalFeesCollectedUsdc/Weth only grows by what was
+        // actually sent, not by what "should have" gone out.
         if (feeAmount0 > 0 || feeAmount1 > 0) {
             bool sent0 = feeAmount0 == 0 || _tryTransferFee(token0, feeAmount0);
             bool sent1 = feeAmount1 == 0 || _tryTransferFee(token1, feeAmount1);
@@ -1328,12 +1432,31 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// @dev Внешний вызов transfer() обёрнут в try/catch напрямую (не через
-    ///      safeTransfer()) — try/catch в Solidity умеет оборачивать только
-    ///      прямой внешний вызов, не обёртку библиотеки поверх него.
-    ///      Для USDC/WETH (оба — стандартные, корректно возвращающие bool
-    ///      токены) это не теряет защиту, которую даёт safeTransfer именно
-    ///      для НЕстандартных токенов — здесь она и не требовалась.
+    /// @dev The external transfer() call is wrapped in try/catch directly
+    ///      (not via safeTransfer()) — Solidity's try/catch can only wrap a
+    ///      direct external call, not a library wrapper on top of one. For
+    ///      USDC/WETH (both standard, correctly bool-returning tokens) this
+    ///      doesn't give up the protection safeTransfer() provides
+    ///      specifically for NON-standard tokens — it wasn't needed here.
+    ///
+    ///      Static-analysis note: linters commonly flag a raw ERC-20
+    ///      transfer() call like this as "unchecked transfer" — that
+    ///      warning is a false positive here specifically. This contract
+    ///      only ever calls this with USDC or WETH (see the constructor —
+    ///      both are fixed at deployment, never arbitrary user-supplied
+    ///      tokens), and both are standard, well-audited implementations
+    ///      that always either return true on success or revert — neither
+    ///      silently returns false. The return value IS checked and
+    ///      correctly acted on regardless: totalFeesCollectedUsdc/Weth are
+    ///      only incremented when the transfer actually succeeded (see
+    ///      sent0/sent1 at the call site above) — a failure here is fully
+    ///      handled, not ignored, it just doesn't revert the whole
+    ///      transaction (see this function's caller for why that matters).
+    ///      Using SafeERC20.safeTransfer() instead is not possible at this
+    ///      specific call site: it's an internal library function (jumped
+    ///      to, not DELEGATECALL'd), and Solidity's try/catch only wraps
+    ///      genuine external calls or contract creation — wrapping
+    ///      safeTransfer() in try/catch simply doesn't compile.
     function _tryTransferFee(address token, uint256 amount) private returns (bool sent) {
         try IERC20(token).transfer(feeRecipient, amount) returns (bool ok) {
             return ok;
@@ -1358,13 +1481,13 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         uint256 balance0 = IERC20(token0).balanceOf(address(this));
         uint256 balance1 = IERC20(token1).balanceOf(address(this));
 
-        // Пропускаем approve() целиком, если текущего одобрения уже
-        // достаточно (третий раунд аудита, находка #3 про газ) — раз мы
-        // больше не сбрасываем allowance в 0 после mint() (прошлый раунд),
-        // остаток с предыдущего цикла нередко уже достаточен, особенно для
-        // стороны, что обычно потребляется не полностью в наших
-        // односторонних диапазонах. Дешёвое чтение allowance() вместо
-        // дорогого approve(), когда он и так не нужен.
+        // Skip approve() entirely if the current allowance is already
+        // sufficient (round 3 audit, gas finding #3) — since we no longer
+        // reset allowance to 0 after mint() (round 2), leftover from the
+        // previous cycle is often already enough, especially for the side
+        // that isn't usually fully consumed in our single-sided ranges.
+        // Cheap allowance() read instead of an expensive approve() when
+        // it's not even needed.
         if (IERC20(token0).allowance(address(this), address(positionManager)) < balance0) {
             IERC20(token0).forceApprove(address(positionManager), balance0);
         }
@@ -1388,15 +1511,14 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
             })
         );
 
-        // Не сбрасываем approval обратно в 0 здесь (было раньше) — по
-        // замечанию второго раунда аудита: forceApprove() сама уже умеет
-        // корректно переписывать одобрение при СЛЕДУЮЩЕМ вызове (сначала
-        // пробует approve() напрямую на новое значение, и только если
-        // токен это не разрешает — как раз сценарий, ради которого
-        // forceApprove вообще существует — сама падает обратно на сброс
-        // через 0). Ручной сброс здесь был чистой тратой газа (~5-10k за
-        // ребаланс) без какой-либо дополнительной защиты сверх того, что
-        // forceApprove и так гарантирует на следующий вызов.
+        // Don't reset the approval back to 0 here (used to) — per the
+        // round-2 audit note: forceApprove() already knows how to correctly
+        // rewrite the approval on the NEXT call (tries a direct approve()
+        // to the new value first, and only falls back to resetting via 0 if
+        // the token doesn't allow that — exactly the scenario forceApprove
+        // exists for in the first place). The manual reset here was a pure
+        // gas cost (~5-10k per rebalance) with no additional protection
+        // beyond what forceApprove already guarantees on the next call.
     }
 
     /// @dev Security audit finding M002 (independent, second review):
@@ -1478,27 +1600,27 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         return totalYieldEarnedUsdc + (totalYieldEarnedWeth == 0 ? 0 : _wethToUsdc(totalYieldEarnedWeth));
     }
 
-    /// @notice Персональный доход конкретного пользователя — текущая
-    ///         стоимость его долей минус его costBasis (пропорционально
-    ///         скорректированная стоимость вложения — см. докстринг у
-    ///         costBasis). Может быть отрицательным (int256, не uint256) —
-    ///         например, если позиция ещё не отбила газ или временно
-    ///         просела в цене.
+    /// @notice A specific user's personal profit — the current value of
+    ///         their shares minus their costBasis (proportionally-adjusted
+    ///         cost basis — see costBasis's own docstring). Can be negative
+    ///         (int256, not uint256) — for example, if the position hasn't
+    ///         covered gas yet, or has temporarily dipped in price.
     function personalProfit(address user) external view returns (int256) {
         uint256 currentValue = convertToAssets(balanceOf(user));
         return int256(currentValue) - int256(costBasis[user]);
     }
 
-    /// @notice Персональный доход конкретного пользователя от предоставления
-    ///         ликвидности (торговые комиссии), в одном USD-эквиваленте —
-    ///         НЕЗАВИСИМЫЙ от движения цены ETH, в отличие от personalProfit()
-    ///         выше (см. докстринг у accYieldPerShareUsdc/Weth). Включает уже
-    ///         зафиксированную часть (personalYieldEarnedUsdc/Weth) плюс ещё
-    ///         не расчётную (pending) с последнего чекпоинта — число живое,
-    ///         обновляется между транзакциями, не только в момент их
-    ///         совершения. Это то, что положено показывать на сайте как
-    ///         "Заработано вами на комиссиях, с момента вашего первого
-    ///         депозита" — аналог totalYieldEarnedUsdValue(), но персонально.
+    /// @notice A specific user's personal income from providing liquidity
+    ///         (trading fees), as a single USD-equivalent figure —
+    ///         INDEPENDENT of ETH price movement, unlike personalProfit()
+    ///         above (see accYieldPerShareUsdc/Weth's own docstring).
+    ///         Includes the already-settled portion (personalYieldEarnedUsdc/
+    ///         Weth) plus the not-yet-settled (pending) part since the last
+    ///         checkpoint — the number is live, updating between
+    ///         transactions, not only at the moment they occur. This is
+    ///         what's meant to be shown on the site as "Earned in fees,
+    ///         since your first deposit" — the personal counterpart to
+    ///         totalYieldEarnedUsdValue().
     function personalFeesEarnedUsdValue(address user) external view returns (uint256) {
         uint256 bal = balanceOf(user);
         uint256 pendingUsdc = bal > 0 ? (bal * accYieldPerShareUsdc) / YIELD_PRECISION - _yieldDebtUsdc[user] : 0;
@@ -1732,22 +1854,21 @@ contract CryptoRangeKeeperVault is ERC4626, Ownable2Step, ReentrancyGuard {
         }
     }
 
-    // ---- Обратная задача: сколько ликвидности реально получится из
-    // имеющихся сумм ---- (LiquidityAmounts.getLiquidityForAmounts, тот же
-    // порт, что уже сделан для бота в bot/tickMath.js — здесь нужен и
-    // ончейн-вариант для _reopenPositionAfterWithdrawal(), у которой нет
-    // бота с готовыми числами).
+    // ---- Reverse problem: how much liquidity is actually achievable from
+    // the amounts on hand ---- (LiquidityAmounts.getLiquidityForAmounts, the
+    // same port already done for the bot in bot/tickMath.js — an on-chain
+    // version is also needed here for _reopenPositionAfterWithdrawal(),
+    // which has no bot feeding it ready-made numbers).
     //
-    // Security audit finding L001: сужающее приведение uint256 -> uint128
-    // само по себе молча "заворачивается" (truncate), если результат
-    // превышает предел uint128 — Solidity не проверяет это автоматически
-    // для явных приведений типов (в отличие от арифметики, где overflow
-    // ловится сам). На практике результат сюда попадает из FullMath.mulDiv
-    // при реалистичных суммах вейлта (посчитано отдельно — переполнение
-    // потребовало бы порядка $10^24, астрономически недостижимо), но
-    // явная проверка ничего не стоит и полностью убирает даже
-    // теоретический риск — тот же приём, что использует сам Uniswap в
-    // своём toUint128().
+    // Security audit finding L001: narrowing uint256 -> uint128 silently
+    // "wraps" (truncates) on its own if the result exceeds uint128's limit
+    // — Solidity doesn't check this automatically for explicit type casts
+    // (unlike arithmetic, where overflow is caught on its own). In practice
+    // the result reaching here comes from FullMath.mulDiv at realistic
+    // vault sizes (computed separately — overflow would require on the
+    // order of $10^24, astronomically unreachable), but the explicit check
+    // costs nothing and closes even the theoretical risk entirely — the
+    // same technique Uniswap itself uses in its own toUint128().
     function _toUint128(uint256 value) private pure returns (uint128) {
         if (value > type(uint128).max) revert LiquidityOverflow();
         return uint128(value);
